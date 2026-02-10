@@ -11,13 +11,25 @@ Route::prefix('bitbucket')->group(function () {
     Route::get('/test-auth', [BitbucketController::class, 'testAuthentication']);
     Route::delete('/cache', [BitbucketController::class, 'clearCache']);
     Route::get('/debug/{repo}', [BitbucketController::class, 'debugRepository']);
+    
+    // Data sync routes
+    Route::post('/sync/repositories', [BitbucketController::class, 'syncRepositories']);
+    Route::post('/sync/commits', [BitbucketController::class, 'syncCommits']);
+    Route::post('/sync/pull-requests', [BitbucketController::class, 'syncPullRequests']);
+    Route::post('/sync/all', [BitbucketController::class, 'syncAll']);
 });
 
 Route::prefix('repositories')->group(function () {
     Route::get('/', [UserRepositoryController::class, 'index']);
     Route::get('/user', [UserRepositoryController::class, 'getUserRepositories']);
     Route::post('/user', [UserRepositoryController::class, 'addRepositories']);
+    Route::patch('/user', [UserRepositoryController::class, 'updateUserRepositories']); // Bulk update enabled repositories
     Route::delete('/user/{repository}', [UserRepositoryController::class, 'removeRepository']);
+    
+    // Individual repository enable/disable routes (kept for backwards compatibility)
+    Route::patch('/user/{repository}/enable', [UserRepositoryController::class, 'enableRepository']);
+    Route::patch('/user/{repository}/disable', [UserRepositoryController::class, 'disableRepository']);
+    Route::patch('/user/{repository}/toggle', [UserRepositoryController::class, 'toggleRepository']);
 });
 
 Route::get('/user', function (Request $request) {

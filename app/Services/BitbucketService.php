@@ -2,6 +2,9 @@
 
 namespace App\Services;
 
+use App\Models\Repository;
+use App\Models\Commit;
+use App\Models\PullRequest;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\RequestException;
 use Illuminate\Support\Facades\Cache;
@@ -28,43 +31,181 @@ class BitbucketService
     }
 
     /**
-     * Fetch all commits and pull requests
+     * Fetch all commits and pull requests (using local data when possible)
      */
     public function fetchAllData(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null): array
     {
-        $repositories = $this->getRepositories();
+        // Try to get data from local database first
+        $localData = $this->fetchLocalData($maxDays, $selectedRepos, $authorFilter);
         
-        if ($selectedRepos) {
-            $repositories = array_filter($repositories, fn($repo) => 
-                in_array($repo['full_name'], $selectedRepos)
-            );
-        } else {
-            // Limit to most recently updated repositories to prevent timeouts
-            $repositories = array_slice($repositories, 0, 10);
+        // For now, prioritize local data to prevent timeouts
+        // Only refresh if we have no local data at all
+        if (!empty($localData)) {
+            \Log::info("Using local data (" . count($localData) . " items found)");
+            return $localData;
         }
+        
+        // Only check for API refresh if we have no local data
+        \Log::info("No local data found, checking if API refresh is needed");
+        $needsRefresh = $this->checkIfDataNeedsRefresh($selectedRepos, $maxDays);
+        
+        if ($needsRefresh) {
+            \Log::info("Refreshing data from API");
+            // Refresh data from API for repositories that need it
+            $this->refreshDataFromApi($maxDays, $selectedRepos, $authorFilter);
+            // Re-fetch local data after refresh
+            $localData = $this->fetchLocalData($maxDays, $selectedRepos, $authorFilter); 
+        }
+        
+        return $localData;
+    }
 
+    /**
+     * Fetch data from local database
+     */
+    protected function fetchLocalData(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null): array
+    {
         $allData = [];
         
-        foreach ($repositories as $repo) {
+        // Get repositories
+        $repositoriesQuery = Repository::active();
+        if ($selectedRepos) {
+            $repositoriesQuery->whereIn('full_name', $selectedRepos);
+        }
+        $repositories = $repositoriesQuery->get();
+        
+        foreach ($repositories as $repository) {
+            // Fetch commits from database
+            $commitsQuery = $repository->commits()->recent($maxDays);
+            if ($authorFilter) {
+                $commitsQuery->byAuthor($authorFilter);
+            }
+            $commits = $commitsQuery->get();
+            
+            foreach ($commits as $commit) {
+                $allData[] = [
+                    'type' => 'commit',
+                    'repository' => $repository->full_name,
+                    'hash' => $commit->hash,
+                    'date' => $commit->commit_date->toISOString(),
+                    'message' => $commit->message,
+                    'author_raw' => $commit->author_raw,
+                    'author_username' => $commit->author_username,
+                    'ticket' => $commit->ticket
+                ];
+            }
+            
+            // Fetch pull requests from database
+            $prsQuery = $repository->pullRequests()->recent($maxDays);
+            if ($authorFilter) {
+                $prsQuery->byAuthor($authorFilter);
+            }
+            $pullRequests = $prsQuery->get();
+            
+            foreach ($pullRequests as $pr) {
+                $allData[] = [
+                    'type' => 'pull_request',
+                    'repository' => $repository->full_name,
+                    'id' => $pr->bitbucket_id,
+                    'title' => $pr->title,
+                    'author' => $pr->author_display_name,
+                    'created_on' => $pr->created_on->toISOString(),
+                    'updated_on' => $pr->updated_on->toISOString(),
+                    'state' => $pr->state,
+                    'ticket' => $pr->ticket
+                ];
+            }
+        }
+        
+        // Sort by date (newest first)
+        usort($allData, function($a, $b) {
+            $dateA = $a['type'] === 'commit' ? $a['date'] : $a['updated_on'];
+            $dateB = $b['type'] === 'commit' ? $b['date'] : $b['updated_on'];
+            
+            return strcmp($dateB, $dateA);
+        });
+        
+        return $allData;
+    }
+
+    /**
+     * Check if local data needs refreshing from API
+     */
+    protected function checkIfDataNeedsRefresh(?array $selectedRepos = null, int $maxDays = 14, int $maxAgeMinutes = 30): bool
+    {
+        // If we have recent local data, don't refresh from API
+        $repositoriesQuery = Repository::active();
+        if ($selectedRepos) {
+            $repositoriesQuery->whereIn('full_name', $selectedRepos);
+        }
+        $repositories = $repositoriesQuery->get();
+        
+        if ($repositories->isEmpty()) {
+            return true; // No matching repositories, need to refresh
+        }
+        
+        foreach ($repositories as $repository) {
+            // Check if we have any recent commits for this repository
+            $recentCommits = $repository->commits()
+                ->recent($maxDays)
+                ->count();
+            
+            // Check if we have any recent pull requests for this repository  
+            $recentPrs = $repository->pullRequests()
+                ->recent($maxDays)
+                ->count();
+            
+            // If we have no recent data at all for this repo, we need to refresh
+            if ($recentCommits === 0 && $recentPrs === 0) {
+                \Log::info("No recent data for {$repository->full_name}, needs refresh");
+                return true;
+            }
+            
+            // Check if any data is too old
+            $staleCommits = $repository->commits()
+                ->recent($maxDays)
+                ->needsUpdate($maxAgeMinutes)
+                ->count();
+            
+            if ($staleCommits > 0) {
+                \Log::info("Stale commits for {$repository->full_name}, needs refresh");
+                return true;
+            }
+        }
+        
+        \Log::info("Local data is fresh, no API refresh needed");
+        return false;
+    }
+
+    /**
+     * Refresh data from API for repositories that need it
+     */
+    protected function refreshDataFromApi(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null): void
+    {
+        $repositoriesQuery = Repository::active();
+        if ($selectedRepos) {
+            $repositoriesQuery->whereIn('full_name', $selectedRepos);
+        } else {
+            // Limit to prevent timeouts
+            $repositoriesQuery->limit(10);
+        }
+        $repositories = $repositoriesQuery->get();
+        
+        foreach ($repositories as $repository) {
             try {
-                // Fetch pull requests
-                $pullRequests = $this->fetchPullRequests($repo['full_name'], $maxDays);
-                $allData = array_merge($allData, $pullRequests);
+                // Refresh commits
+                $commits = $this->fetchCommitsFromApi($repository->full_name, $maxDays, $authorFilter);
+                $this->storeCommits($repository, $commits);
                 
-                // Fetch commits directly from repository
-                $commits = $this->fetchCommits($repo['full_name'], $maxDays, $authorFilter);
-                $allData = array_merge($allData, $commits);
+                // Refresh pull requests
+                $pullRequests = $this->fetchPullRequestsFromApi($repository->full_name, $maxDays);
+                $this->storePullRequests($repository, $pullRequests);
+                
             } catch (\Exception $e) {
-                // Log error but continue with other repositories
-                \Log::warning("Failed to fetch data from repository {$repo['full_name']}: " . $e->getMessage());
+                \Log::warning("Failed to refresh data for repository {$repository->full_name}: " . $e->getMessage());
                 continue;
             }
         }
-
-        // Deduplicate and sort by date
-        $allData = $this->deduplicateAndSort($allData);
-        
-        return $allData;
     }
 
     /**
@@ -171,6 +312,87 @@ class BitbucketService
         }
         
         return $repositories;
+    }
+
+    /**
+     * Fetch commits for a specific repository (for sync commands)
+     */
+    public function fetchCommitsForRepository(string $repoFullName, int $maxDays = 14): array
+    {
+        return $this->fetchCommitsFromApi($repoFullName, $maxDays);
+    }
+
+    /**
+     * Fetch pull requests for a specific repository (for sync commands)
+     */
+    public function fetchPullRequestsForRepository(string $repoFullName, int $maxDays = 14): array
+    {
+        return $this->fetchPullRequestsFromApi($repoFullName, $maxDays);
+    }
+
+    /**
+     * Fetch commits from Bitbucket API
+     */
+    protected function fetchCommitsFromApi(string $repoFullName, int $maxDays, ?string $authorFilter = null): array
+    {
+        return $this->fetchCommits($repoFullName, $maxDays, $authorFilter);
+    }
+
+    /**
+     * Fetch pull requests from Bitbucket API
+     */
+    protected function fetchPullRequestsFromApi(string $repoFullName, int $maxDays): array
+    {
+        return $this->fetchPullRequests($repoFullName, $maxDays);
+    }
+
+    /**
+     * Store commits in local database
+     */
+    protected function storeCommits(Repository $repository, array $commits): void
+    {
+        foreach ($commits as $commitData) {
+            Commit::updateOrCreate(
+                [
+                    'repository_id' => $repository->id,
+                    'hash' => $commitData['hash']
+                ],
+                [
+                    'commit_date' => $commitData['date'],
+                    'message' => $commitData['message'],
+                    'author_raw' => $commitData['author_raw'],
+                    'author_username' => $commitData['author_username'],
+                    'ticket' => $commitData['ticket'],
+                    'bitbucket_data' => $commitData,
+                    'last_fetched_at' => now()
+                ]
+            );
+        }
+    }
+
+    /**
+     * Store pull requests in local database
+     */
+    protected function storePullRequests(Repository $repository, array $pullRequests): void
+    {
+        foreach ($pullRequests as $prData) {
+            PullRequest::updateOrCreate(
+                [
+                    'repository_id' => $repository->id,
+                    'bitbucket_id' => $prData['id']
+                ],
+                [
+                    'title' => $prData['title'],
+                    'author_display_name' => $prData['author'],
+                    'created_on' => $prData['created_on'],
+                    'updated_on' => $prData['updated_on'],
+                    'state' => $prData['state'],
+                    'ticket' => $prData['ticket'],
+                    'bitbucket_data' => $prData,
+                    'last_fetched_at' => now()
+                ]
+            );
+        }
     }
 
     /**

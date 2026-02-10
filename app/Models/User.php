@@ -53,7 +53,7 @@ class User extends Authenticatable
     public function repositories(): BelongsToMany
     {
         return $this->belongsToMany(Repository::class, 'user_repositories')
-                    ->withPivot('is_primary')
+                    ->withPivot(['is_primary', 'is_enabled'])
                     ->withTimestamps();
     }
 
@@ -63,5 +63,23 @@ class User extends Authenticatable
     public function primaryRepositories(): BelongsToMany
     {
         return $this->repositories()->wherePivot('is_primary', true);
+    }
+
+    /**
+     * Get user's enabled repositories
+     */
+    public function enabledRepositories(): BelongsToMany
+    {
+        return $this->repositories()->wherePivot('is_enabled', true);
+    }
+
+    /**
+     * Get user's enabled primary repositories
+     */
+    public function enabledPrimaryRepositories(): BelongsToMany
+    {
+        return $this->repositories()
+                    ->wherePivot('is_primary', true)
+                    ->wherePivot('is_enabled', true);
     }
 }

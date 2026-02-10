@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\User;
 use App\Services\BitbucketService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
@@ -43,6 +44,30 @@ class BitbucketController extends Controller
         $author = $request->input('author');
         $forceRefresh = $request->input('force_refresh', false);
 
+        // If no repositories specified, load user's enabled repositories
+        if (empty($repositories)) {
+            $user = User::where('email', env('BITBUCKET_AUTHOR_EMAIL'))->first();
+            
+            if ($user) {
+                $repositories = $user->repositories()
+                                   ->wherePivot('is_enabled', true)
+                                   ->pluck('full_name')
+                                   ->toArray();
+                                   
+                if (empty($repositories)) {
+                    return response()->json([
+                        'error' => 'No enabled repositories found for user',
+                        'message' => 'Please enable some repositories first via PATCH /api/repositories/user'
+                    ], 400);
+                }
+            } else {
+                return response()->json([
+                    'error' => 'User not found',
+                    'message' => 'Please setup your repositories first via PATCH /api/repositories/user'
+                ], 404);
+            }
+        }
+
         $cacheKey = 'bitbucket_data_' . md5(json_encode([
             'days' => $days,
             'repositories' => $repositories,
@@ -53,7 +78,8 @@ class BitbucketController extends Controller
             return response()->json([
                 'data' => Cache::get($cacheKey),
                 'cached' => true,
-                'cache_expires_at' => Cache::get($cacheKey . '_expires')
+                'cache_expires_at' => Cache::get($cacheKey . '_expires'),
+                'repositories_used' => $repositories
             ]);
         }
 
@@ -68,7 +94,8 @@ class BitbucketController extends Controller
             return response()->json([
                 'data' => $data,
                 'cached' => false,
-                'cache_expires_at' => $expiresAt->toISOString()
+                'cache_expires_at' => $expiresAt->toISOString(),
+                'repositories_used' => $repositories
             ]);
 
         } catch (\Exception $e) {
@@ -171,6 +198,108 @@ class BitbucketController extends Controller
             return response()->json([
                 'error' => $e->getMessage(),
                 'repository' => $repo
+            ], 500);
+        }
+    }
+
+    /**
+     * Trigger repository sync
+     */
+    public function syncRepositories(): JsonResponse
+    {
+        try {
+            \Artisan::call('bitbucket:sync-repositories', ['--force' => true]);
+            $output = \Artisan::output();
+            
+            return response()->json([
+                'message' => 'Repository sync completed',
+                'output' => $output
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Sync failed',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Trigger commits sync
+     */
+    public function syncCommits(Request $request): JsonResponse
+    {
+        $days = $request->input('days', 14);
+        
+        try {
+            \Artisan::call('bitbucket:sync-commits', [
+                '--days' => $days,
+                '--force' => true
+            ]);
+            $output = \Artisan::output();
+            
+            return response()->json([
+                'message' => 'Commits sync completed',
+                'days' => $days,
+                'output' => $output
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Commits sync failed',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Trigger pull requests sync
+     */
+    public function syncPullRequests(Request $request): JsonResponse
+    {
+        $days = $request->input('days', 14);
+        
+        try {
+            \Artisan::call('bitbucket:sync-pull-requests', [
+                '--days' => $days,
+                '--force' => true
+            ]);
+            $output = \Artisan::output();
+            
+            return response()->json([
+                'message' => 'Pull requests sync completed',
+                'days' => $days,
+                'output' => $output
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Pull requests sync failed',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Trigger complete sync of all data
+     */
+    public function syncAll(Request $request): JsonResponse
+    {
+        $days = $request->input('days', 14);
+        
+        try {
+            \Artisan::call('bitbucket:sync-all', [
+                '--days' => $days,
+                '--force' => true
+            ]);
+            $output = \Artisan::output();
+            
+            return response()->json([
+                'message' => 'Complete sync finished',
+                'days' => $days,
+                'output' => $output
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Complete sync failed',
+                'message' => $e->getMessage()
             ], 500);
         }
     }
