@@ -33,8 +33,15 @@ class BitbucketService
     /**
      * Fetch all commits and pull requests (using local data when possible)
      */
-    public function fetchAllData(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null): array
+    public function fetchAllData(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, bool $forceRefresh = false): array
     {
+        // If force refresh is requested, skip local data and refresh from API
+        if ($forceRefresh) {
+            \Log::info("Force refresh requested, fetching from API");
+            $this->refreshDataFromApi($maxDays, $selectedRepos, $authorFilter);
+            return $this->fetchLocalData($maxDays, $selectedRepos, $authorFilter);
+        }
+        
         // Try to get data from local database first
         $localData = $this->fetchLocalData($maxDays, $selectedRepos, $authorFilter);
         
@@ -91,7 +98,9 @@ class BitbucketService
                     'message' => $commit->message,
                     'author_raw' => $commit->author_raw,
                     'author_username' => $commit->author_username,
-                    'ticket' => $commit->ticket
+                    'ticket' => $commit->ticket,
+                    'branch' => $commit->branch,
+                    'pull_request_id' => $commit->pull_request_id
                 ];
             }
             
@@ -193,13 +202,21 @@ class BitbucketService
         
         foreach ($repositories as $repository) {
             try {
-                // Refresh commits
-                $commits = $this->fetchCommitsFromApi($repository->full_name, $maxDays, $authorFilter);
-                $this->storeCommits($repository, $commits);
+                \Log::info("Refreshing data for repository: {$repository->full_name}");
                 
-                // Refresh pull requests
+                // First, fetch pull requests 
                 $pullRequests = $this->fetchPullRequestsFromApi($repository->full_name, $maxDays);
                 $this->storePullRequests($repository, $pullRequests);
+                
+                // Then fetch commits from each pull request (captures feature branch commits)
+                $prCommits = $this->fetchCommitsFromPullRequests($repository->full_name, $pullRequests, $maxDays, $authorFilter);
+                $this->storeCommits($repository, $prCommits);
+                
+                // Also fetch regular repository commits (for commits not in PRs)
+                $repoCommits = $this->fetchCommitsFromApi($repository->full_name, $maxDays, $authorFilter);
+                $this->storeCommits($repository, $repoCommits);
+                
+                \Log::info("Refreshed {$repository->full_name}: " . count($prCommits) . " PR commits, " . count($repoCommits) . " repo commits, " . count($pullRequests) . " pull requests");
                 
             } catch (\Exception $e) {
                 \Log::warning("Failed to refresh data for repository {$repository->full_name}: " . $e->getMessage());
@@ -363,6 +380,8 @@ class BitbucketService
                     'author_raw' => $commitData['author_raw'],
                     'author_username' => $commitData['author_username'],
                     'ticket' => $commitData['ticket'],
+                    'branch' => $commitData['branch'] ?? 'main',
+                    'pull_request_id' => $commitData['from_pull_request'] ?? null,
                     'bitbucket_data' => $commitData,
                     'last_fetched_at' => now()
                 ]
@@ -398,36 +417,66 @@ class BitbucketService
     /**
      * Fetch pull requests for a repository
      */
+    /**
+     * Fetch pull requests with pagination (like the old tool)
+     */
     protected function fetchPullRequests(string $repoFullName, int $maxDays): array
     {
         $since = now()->subDays($maxDays)->format('Y-m-d');
         
-        $response = $this->makeRequest("repositories/{$repoFullName}/pullrequests", [
-            'state' => 'OPEN,MERGED,DECLINED,SUPERSEDED',
-            'sort' => '-updated_on',
-            'q' => "updated_on>={$since}",
-            'fields' => 'values.id,values.title,values.author.display_name,values.created_on,values.updated_on,values.state,values.links.commits.href'
-        ]);
+        \Log::info("Fetching pull requests for {$repoFullName} since {$since}");
         
-        if (!isset($response['values'])) {
-            return [];
+        $allPullRequests = [];
+        $currentUrl = "repositories/{$repoFullName}/pullrequests";
+        $maxPages = 10; // Limit to prevent excessive API calls
+        $pageCount = 0;
+        
+        while ($currentUrl && $pageCount < $maxPages) {
+            $params = [
+                'state' => 'OPEN,MERGED,DECLINED,SUPERSEDED',
+                'sort' => '-updated_on',
+                'q' => "updated_on>={$since}",
+                'pagelen' => 50, // Higher limit to get more PRs
+                'fields' => 'values.id,values.title,values.author.display_name,values.created_on,values.updated_on,values.state,values.links.commits.href,next'
+            ];
+            
+            $response = $this->makeRequest($currentUrl, $params);
+            
+            if (!isset($response['values'])) {
+                break;
+            }
+            
+            \Log::info("Found " . count($response['values']) . " pull requests on page " . ($pageCount + 1) . " for {$repoFullName}");
+            
+            foreach ($response['values'] as $pr) {
+                $allPullRequests[] = [
+                    'type' => 'pull_request',
+                    'repository' => $repoFullName,
+                    'bitbucket_id' => $pr['id'], // Store this for commits endpoint
+                    'id' => $pr['id'],
+                    'title' => $pr['title'],
+                    'author' => $pr['author']['display_name'] ?? null,
+                    'created_on' => $pr['created_on'],
+                    'updated_on' => $pr['updated_on'], 
+                    'state' => $pr['state'] ?? null,
+                    'ticket' => $this->extractTicket($pr['title'])
+                ];
+            }
+            
+            // Check for next page
+            $currentUrl = $response['next'] ?? null;
+            if ($currentUrl) {
+                // Extract just the path from the full URL for API consistency
+                $currentUrl = parse_url($currentUrl, PHP_URL_PATH) . '?' . parse_url($currentUrl, PHP_URL_QUERY);
+                $currentUrl = ltrim($currentUrl, '/2.0/');
+            }
+            
+            $pageCount++;
         }
         
-        return array_map(function($pr) use ($repoFullName) {
-            return [
-                'type' => 'pull_request',
-                'repository' => $repoFullName,
-                'id' => $pr['id'],
-                'title' => $pr['title'],
-                'author' => $pr['author']['display_name'] ?? null,
-                'created_on' => $pr['created_on'],
-                'updated_on' => $pr['updated_on'],
-                'state' => $pr['state'] ?? null,
-                'ticket' => $this->extractTicket($pr['title'])
-            ];
-        }, array_filter($response['values'], function($pr) {
-            return ($pr['author']['display_name'] ?? '') === $this->config['author_display_name'];
-        }));
+        \Log::info("Total pull requests fetched for {$repoFullName}: " . count($allPullRequests));
+        
+        return $allPullRequests;
     }
 
     /**
@@ -439,46 +488,162 @@ class BitbucketService
         
         \Log::info("Fetching commits for {$repoFullName} since {$since}");
         
-        // Use server-side filtering by username with pagination limit
-        $response = $this->makeRequest("repositories/{$repoFullName}/commits", [
-            'q' => "date>={$since}",
-            'sort' => '-date',
-            'pagelen' => 25,  // Limit results to prevent timeouts
-            'fields' => 'values.hash,values.date,values.message,values.author.raw,values.author.user.username'
-        ]);
+        $allCommits = [];
+        $currentUrl = "repositories/{$repoFullName}/commits";
+        $maxPages = 3; // Limit to 3 pages to prevent excessive API calls
+        $pageCount = 0;
         
-        if (!isset($response['values'])) {
-            \Log::info("No commits found for {$repoFullName}");
-            return [];
+        while ($currentUrl && $pageCount < $maxPages) {
+            $params = [
+                'q' => "date>={$since}",
+                'sort' => '-date', 
+                'pagelen' => 100,  // Increased limit to get more commits
+                'fields' => 'values.hash,values.date,values.message,values.author.raw,values.author.user.username,values.repository.full_name,next'
+            ];
+            
+            $response = $this->makeRequest($currentUrl, $params);
+            
+            if (!isset($response['values'])) {
+                break;
+            }
+            
+            \Log::info("Found " . count($response['values']) . " commits on page " . ($pageCount + 1) . " for {$repoFullName}");
+            
+            // Get the main branch for this repository once
+            $mainBranch = $this->getMainBranch($repoFullName);
+            
+            foreach ($response['values'] as $commit) {
+                // Extract branch information from commit message or use main branch as fallback
+                $branchName = $this->extractBranchFromCommitMessage($commit['message']) ?? $mainBranch;
+                
+                $allCommits[] = [
+                    'type' => 'commit',
+                    'repository' => $repoFullName,
+                    'hash' => $commit['hash'],
+                    'date' => $commit['date'],
+                    'message' => $commit['message'],
+                    'author_raw' => $commit['author']['raw'] ?? null,
+                    'author_username' => $commit['author']['user']['username'] ?? null,
+                    'ticket' => $this->extractTicket($commit['message']),
+                    'branch' => $branchName
+                ];
+            }
+            
+            // Check for next page
+            $currentUrl = $response['next'] ?? null;
+            if ($currentUrl) {
+                // Extract just the path from the full URL for API consistency
+                $currentUrl = parse_url($currentUrl, PHP_URL_PATH) . '?' . parse_url($currentUrl, PHP_URL_QUERY);
+                $currentUrl = ltrim($currentUrl, '/2.0/');
+            }
+            
+            $pageCount++;
         }
         
-        \Log::info("Found " . count($response['values']) . " total commits for {$repoFullName}");
-        
-        $commits = array_map(function($commit) use ($repoFullName) {
-            return [
-                'type' => 'commit',
-                'repository' => $repoFullName,
-                'hash' => $commit['hash'],
-                'date' => $commit['date'],
-                'message' => $commit['message'],
-                'author_raw' => $commit['author']['raw'] ?? null,
-                'author_username' => $commit['author']['user']['username'] ?? null,
-                'ticket' => $this->extractTicket($commit['message'])
-            ];
-        }, $response['values']);
+        \Log::info("Total commits fetched for {$repoFullName}: " . count($allCommits));
         
         // Filter by author if provided
         if (!empty($authorFilter)) {
             \Log::info("Filtering by author: {$authorFilter}");
-            $commits = array_filter($commits, function($commit) use ($authorFilter) {
+            $allCommits = array_filter($allCommits, function($commit) use ($authorFilter) {
                 $authorName = $commit['author_username'] ?? '';
                 $authorEmail = $commit['author_raw'] ?? '';
                 return str_contains($authorName, $authorFilter) || str_contains($authorEmail, $authorFilter);
             });
-            \Log::info("After filtering: " . count($commits) . " commits for {$repoFullName}");
+            \Log::info("After filtering: " . count($allCommits) . " commits for {$repoFullName}");
         }
         
-        return $commits;
+        return $allCommits;
+    }
+
+    /**
+     * Fetch commits from pull requests (captures feature branch commits)
+     */
+    protected function fetchCommitsFromPullRequests(string $repoFullName, array $pullRequests, int $maxDays, ?string $authorFilter = null): array
+    {
+        $since = now()->subDays($maxDays)->format('Y-m-d');
+        $allCommits = [];
+        
+        \Log::info("Fetching commits from " . count($pullRequests) . " pull requests for {$repoFullName}");
+        
+        foreach ($pullRequests as $pullRequest) {
+            try {
+                // Get commits for this pull request
+                $response = $this->makeRequest("repositories/{$repoFullName}/pullrequests/{$pullRequest['bitbucket_id']}/commits", [
+                    'pagelen' => 100,
+                    'fields' => 'values.hash,values.date,values.message,values.author.raw,values.author.user.username,next'
+                ]);
+                
+                if (!isset($response['values']) || empty($response['values'])) {
+                    continue;
+                }
+                
+                // Extract branch from PR title/source branch
+                $branchName = $this->extractBranchFromPRTitle($pullRequest['title']) ?? 
+                             $this->extractBranchFromCommitMessage($pullRequest['title']) ?? 'main';
+                
+                foreach ($response['values'] as $commit) {
+                    // Filter by date
+                    if ($commit['date'] < $since) {
+                        continue;
+                    }
+                    
+                    $commitData = [
+                        'type' => 'commit',
+                        'repository' => $repoFullName,
+                        'hash' => $commit['hash'],
+                        'date' => $commit['date'],
+                        'message' => $commit['message'],
+                        'author_raw' => $commit['author']['raw'] ?? null,
+                        'author_username' => $commit['author']['user']['username'] ?? null,
+                        'ticket' => $this->extractTicket($commit['message']),
+                        'branch' => $branchName,
+                        'from_pull_request' => $pullRequest['bitbucket_id']
+                    ];
+                    
+                    // Filter by author if provided
+                    if ($authorFilter && 
+                        !str_contains($commitData['author_username'] ?? '', $authorFilter) &&
+                        !str_contains($commitData['author_raw'] ?? '', $authorFilter)) {
+                        continue;
+                    }
+                    
+                    $allCommits[] = $commitData;
+                }
+                
+            } catch (\Exception $e) {
+                \Log::warning("Failed to fetch commits for PR {$pullRequest['bitbucket_id']} in {$repoFullName}: " . $e->getMessage());
+                continue;
+            }
+        }
+        
+        \Log::info("Fetched " . count($allCommits) . " commits from pull requests for {$repoFullName}");
+        
+        return $allCommits;
+    }
+
+    /**
+     * Extract branch name from PR title (often contains branch names)
+     */
+    protected function extractBranchFromPRTitle(string $title): ?string
+    {
+        // PR titles often start with the branch name
+        $patterns = [
+            '/^(vue3\/[^\s\-]+)/i',           // vue3/feature-name
+            '/^(feature\/[^\s\-]+)/i',       // feature/ASUITE-123
+            '/^(hotfix\/[^\s\-]+)/i',        // hotfix/something
+            '/^(bugfix\/[^\s\-]+)/i',        // bugfix/something
+            '/^(release\/[^\s\-]+)/i',       // release/something
+            '/^([A-Z]+-\d+[^\s]*)/i',        // ASUITE-123 or ASUITE-123-description
+        ];
+        
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $title, $matches)) {
+                return trim($matches[1]);
+            }
+        }
+        
+        return null;
     }
 
     /**
@@ -590,5 +755,97 @@ class BitbucketService
         });
         
         return $deduplicated;
+    }
+
+    /**
+     * Extract branch name from commit message
+     */
+    protected function extractBranchFromCommitMessage(string $message): ?string
+    {
+        // Common patterns for branch names in commit messages
+        $patterns = [
+            // Merge commit patterns
+            '/Merge branch \'([^\']+)\'/i',
+            '/Merge branch "([^"]+)"/i', 
+            '/Merge branch ([^\s]+)/i',
+            
+            // Pull request merge patterns
+            '/Merged in ([^\/\s]+)/i', // Bitbucket style
+            '/Merge pull request .* from ([^\s]+)/i', // GitHub style
+            
+            // Feature branch patterns in commit messages
+            '/\b(feature\/[^\s\)]+)/i',
+            '/\b(hotfix\/[^\s\)]+)/i', 
+            '/\b(bugfix\/[^\s\)]+)/i',
+            '/\b(release\/[^\s\)]+)/i',
+            '/\b(vue3\/[^\s\)]+)/i', // Your vue3 branches
+            
+            // JIRA ticket branches
+            '/\b([A-Z]+-\d+[^\s\)]*)/i',
+        ];
+        
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $message, $matches)) {
+                $branch = trim($matches[1]);
+                
+                // Clean up common branch name artifacts
+                $branch = rtrim($branch, '.,;:');
+                $branch = str_replace(' into ', '', $branch);
+                
+                // Skip if it's just a ticket number without branch context
+                if (preg_match('/^[A-Z]+-\d+$/', $branch) && !str_contains($message, 'branch')) {
+                    continue;
+                }
+                
+                // Return the first valid branch name found
+                if (strlen($branch) > 0 && strlen($branch) < 100) { // Reasonable length
+                    return $branch;
+                }
+            }
+        }
+        
+        return null; // No branch detected
+    }
+
+    /**
+     * Get the primary branch from a list of branches (optimized) 
+     */
+    protected function getPrimaryBranch(array $branches): string
+    {
+        if (empty($branches)) {
+            return 'main';
+        }
+        
+        // Priority order for common branch names
+        $priority = ['main', 'master', 'develop', 'dev', 'development'];
+        
+        foreach ($priority as $priorityBranch) {
+            if (in_array($priorityBranch, $branches)) {
+                return $priorityBranch;
+            }
+        }
+        
+        // If no priority branch found, return the first one
+        return $branches[0];
+    }
+
+    /**
+     * Get main branch name for repository (simplified)
+     */
+    protected function getMainBranch(string $repoFullName): string
+    {
+        $cacheKey = "main_branch:{$repoFullName}";
+        
+        return Cache::remember($cacheKey, 60 * 60 * 24, function() use ($repoFullName) {
+            // For most repositories, use intelligent defaults based on naming patterns
+            // This avoids expensive API calls while still being reasonably accurate
+            
+            if (str_contains($repoFullName, '/atabase-')) {
+                // Your internal repositories likely use 'main' or 'dev'
+                return 'main';
+            }
+            
+            return 'main'; // Safe default for most modern repositories
+        });
     }
 }

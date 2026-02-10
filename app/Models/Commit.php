@@ -15,6 +15,8 @@ class Commit extends Model
         'author_raw',
         'author_username',
         'ticket',
+        'branch',
+        'pull_request_id',
         'bitbucket_data',
         'last_fetched_at'
     ];
@@ -53,6 +55,14 @@ class Commit extends Model
             $q->where('author_username', 'like', "%{$author}%")
               ->orWhere('author_raw', 'like', "%{$author}%");
         });
+    }
+
+    /**
+     * Scope to filter by branch
+     */
+    public function scopeByBranch($query, string $branch)
+    {
+        return $query->where('branch', $branch);
     }
 
     /**

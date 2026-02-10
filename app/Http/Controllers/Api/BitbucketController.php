@@ -84,7 +84,7 @@ class BitbucketController extends Controller
         }
 
         try {
-            $data = $this->bitbucketService->fetchAllData($days, $repositories, $author);
+            $data = $this->bitbucketService->fetchAllData($days, $repositories, $author, $forceRefresh);
             
             // Cache for 30 minutes
             $expiresAt = now()->addMinutes(30);
