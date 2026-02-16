@@ -7,10 +7,17 @@ use Illuminate\Support\Facades\Route;
 
 Route::prefix('bitbucket')->group(function () {
     Route::get('/commits', [BitbucketController::class, 'getCommitsAndPullRequests']);
+    Route::get('/activity', [BitbucketController::class, 'getActivity']);
     Route::get('/repositories', [BitbucketController::class, 'getRepositories']);
     Route::get('/test-auth', [BitbucketController::class, 'testAuthentication']);
     Route::delete('/cache', [BitbucketController::class, 'clearCache']);
     Route::get('/debug/{repo}', [BitbucketController::class, 'debugRepository']);
+    
+    // Refresh status routes
+    Route::get('/refresh-status', [BitbucketController::class, 'getLatestRefreshStatus']);
+    Route::get('/refresh-status/{jobId}', [BitbucketController::class, 'getRefreshStatusById']);
+    Route::post('/refresh', [BitbucketController::class, 'startRefreshJob']);
+    Route::delete('/refresh-cancel/{jobId}', [BitbucketController::class, 'cancelRefreshJob']);
     
     // Data sync routes
     Route::post('/sync/repositories', [BitbucketController::class, 'syncRepositories']);

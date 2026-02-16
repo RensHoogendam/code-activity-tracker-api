@@ -35,12 +35,8 @@ class BitbucketService
      */
     public function fetchAllData(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, bool $forceRefresh = false): array
     {
-        // If force refresh is requested, skip local data and refresh from API
-        if ($forceRefresh) {
-            \Log::info("Force refresh requested, fetching from API");
-            $this->refreshDataFromApi($maxDays, $selectedRepos, $authorFilter);
-            return $this->fetchLocalData($maxDays, $selectedRepos, $authorFilter);
-        }
+        // Force refresh is now handled by the controller with background jobs
+        // This method always returns local data
         
         // Try to get data from local database first
         $localData = $this->fetchLocalData($maxDays, $selectedRepos, $authorFilter);
@@ -116,12 +112,19 @@ class BitbucketService
                     'type' => 'pull_request',
                     'repository' => $repository->full_name,
                     'id' => $pr->bitbucket_id,
+                    'hash' => null, // PRs don't have commit hashes
+                    'date' => $pr->created_on->toISOString(), // Use created_on as primary date
                     'title' => $pr->title,
+                    'message' => $pr->title, // Use title as message for consistency
                     'author' => $pr->author_display_name,
+                    'author_raw' => $pr->author_display_name, // Use display name for consistency
+                    'author_username' => null, // PRs don't have username
+                    'branch' => $this->extractPRBranchInfo($pr) ?? 'Unknown branch', // Extract from stored PR data
                     'created_on' => $pr->created_on->toISOString(),
                     'updated_on' => $pr->updated_on->toISOString(),
                     'state' => $pr->state,
-                    'ticket' => $pr->ticket
+                    'ticket' => $pr->ticket,
+                    'pull_request_id' => $pr->bitbucket_id // PRs reference themselves
                 ];
             }
         }
@@ -189,28 +192,62 @@ class BitbucketService
     /**
      * Refresh data from API for repositories that need it
      */
-    protected function refreshDataFromApi(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null): void
+    public function refreshDataFromApi(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, ?callable $progressCallback = null): void
     {
+        $startTime = microtime(true);
+        $maxExecutionTime = 45; // Limit to 45 seconds to prevent timeout
+        
         $repositoriesQuery = Repository::active();
         if ($selectedRepos) {
             $repositoriesQuery->whereIn('full_name', $selectedRepos);
+            // For force refresh, limit to prevent timeouts even when specific repos are selected
+            $repositoriesQuery->limit(5);
         } else {
             // Limit to prevent timeouts
-            $repositoriesQuery->limit(10);
+            $repositoriesQuery->limit(3); // Reduced from 10 to 3 for force refresh
         }
         $repositories = $repositoriesQuery->get();
         
-        foreach ($repositories as $repository) {
+        \Log::info("Starting API refresh for " . count($repositories) . " repositories");
+        
+        // Notify progress callback about start
+        if ($progressCallback) {
+            $progressCallback("Starting refresh of " . count($repositories) . " repositories...");
+        }
+        
+        foreach ($repositories as $index => $repository) {
+            // Check if we're approaching timeout limit
+            $currentExecutionTime = microtime(true) - $startTime;
+            if ($currentExecutionTime > $maxExecutionTime) {
+                \Log::warning("API refresh timeout approaching, stopping after {$index} repositories");
+                break;
+            }
+            
             try {
-                \Log::info("Refreshing data for repository: {$repository->full_name}");
+                \Log::info("Refreshing data for repository: {$repository->full_name} (" . ($index + 1) . "/" . count($repositories) . ")");
+                
+                // Notify progress
+                if ($progressCallback) {
+                    $progressCallback("Processing {$repository->full_name} (" . ($index + 1) . "/" . count($repositories) . ") - Fetching pull requests...");
+                }
                 
                 // First, fetch pull requests 
                 $pullRequests = $this->fetchPullRequestsFromApi($repository->full_name, $maxDays);
                 $this->storePullRequests($repository, $pullRequests);
                 
+                // Notify progress
+                if ($progressCallback) {
+                    $progressCallback("Processing {$repository->full_name} (" . ($index + 1) . "/" . count($repositories) . ") - Fetching PR commits...");
+                }
+                
                 // Then fetch commits from each pull request (captures feature branch commits)
                 $prCommits = $this->fetchCommitsFromPullRequests($repository->full_name, $pullRequests, $maxDays, $authorFilter);
                 $this->storeCommits($repository, $prCommits);
+                
+                // Notify progress
+                if ($progressCallback) {
+                    $progressCallback("Processing {$repository->full_name} (" . ($index + 1) . "/" . count($repositories) . ") - Fetching repository commits...");
+                }
                 
                 // Also fetch regular repository commits (for commits not in PRs)
                 $repoCommits = $this->fetchCommitsFromApi($repository->full_name, $maxDays, $authorFilter);
@@ -218,10 +255,23 @@ class BitbucketService
                 
                 \Log::info("Refreshed {$repository->full_name}: " . count($prCommits) . " PR commits, " . count($repoCommits) . " repo commits, " . count($pullRequests) . " pull requests");
                 
+                // Notify completion of this repository
+                if ($progressCallback) {
+                    $progressCallback("Completed {$repository->full_name} (" . ($index + 1) . "/" . count($repositories) . ") - " . (count($prCommits) + count($repoCommits)) . " total commits, " . count($pullRequests) . " pull requests");
+                }
+                
             } catch (\Exception $e) {
                 \Log::warning("Failed to refresh data for repository {$repository->full_name}: " . $e->getMessage());
                 continue;
             }
+        }
+        
+        $totalExecutionTime = microtime(true) - $startTime;
+        \Log::info("API refresh completed in " . round($totalExecutionTime, 2) . " seconds");
+        
+        // Notify final completion
+        if ($progressCallback) {
+            $progressCallback("Refresh completed in " . round($totalExecutionTime, 2) . " seconds!");
         }
     }
 
@@ -437,7 +487,7 @@ class BitbucketService
                 'sort' => '-updated_on',
                 'q' => "updated_on>={$since}",
                 'pagelen' => 50, // Higher limit to get more PRs
-                'fields' => 'values.id,values.title,values.author.display_name,values.created_on,values.updated_on,values.state,values.links.commits.href,next'
+                'fields' => 'values.id,values.title,values.author.display_name,values.created_on,values.updated_on,values.state,values.source.branch.name,values.destination.branch.name,values.links.commits.href,next'
             ];
             
             $response = $this->makeRequest($currentUrl, $params);
@@ -459,6 +509,8 @@ class BitbucketService
                     'created_on' => $pr['created_on'],
                     'updated_on' => $pr['updated_on'], 
                     'state' => $pr['state'] ?? null,
+                    'source_branch' => $pr['source']['branch']['name'] ?? null,
+                    'destination_branch' => $pr['destination']['branch']['name'] ?? null,
                     'ticket' => $this->extractTicket($pr['title'])
                 ];
             }
@@ -480,7 +532,7 @@ class BitbucketService
     }
 
     /**
-     * Fetch commits directly from repository
+     * Fetch commits directly from repository with proper branch detection
      */
     protected function fetchCommits(string $repoFullName, int $maxDays, ?string $authorFilter = null): array
     {
@@ -489,55 +541,79 @@ class BitbucketService
         \Log::info("Fetching commits for {$repoFullName} since {$since}");
         
         $allCommits = [];
-        $currentUrl = "repositories/{$repoFullName}/commits";
-        $maxPages = 3; // Limit to 3 pages to prevent excessive API calls
-        $pageCount = 0;
         
-        while ($currentUrl && $pageCount < $maxPages) {
-            $params = [
-                'q' => "date>={$since}",
-                'sort' => '-date', 
-                'pagelen' => 100,  // Increased limit to get more commits
-                'fields' => 'values.hash,values.date,values.message,values.author.raw,values.author.user.username,values.repository.full_name,next'
-            ];
+        // First, get all branches for the repository
+        $branches = $this->getRepositoryBranches($repoFullName);
+        
+        foreach ($branches as $branch) {
+            \Log::info("Fetching commits from branch '{$branch}' for {$repoFullName}");
             
-            $response = $this->makeRequest($currentUrl, $params);
+            $currentUrl = "repositories/{$repoFullName}/commits/{$branch}";
+            $maxPages = 2; // Limit per branch to prevent excessive API calls
+            $pageCount = 0;
             
-            if (!isset($response['values'])) {
-                break;
-            }
-            
-            \Log::info("Found " . count($response['values']) . " commits on page " . ($pageCount + 1) . " for {$repoFullName}");
-            
-            // Get the main branch for this repository once
-            $mainBranch = $this->getMainBranch($repoFullName);
-            
-            foreach ($response['values'] as $commit) {
-                // Extract branch information from commit message or use main branch as fallback
-                $branchName = $this->extractBranchFromCommitMessage($commit['message']) ?? $mainBranch;
-                
-                $allCommits[] = [
-                    'type' => 'commit',
-                    'repository' => $repoFullName,
-                    'hash' => $commit['hash'],
-                    'date' => $commit['date'],
-                    'message' => $commit['message'],
-                    'author_raw' => $commit['author']['raw'] ?? null,
-                    'author_username' => $commit['author']['user']['username'] ?? null,
-                    'ticket' => $this->extractTicket($commit['message']),
-                    'branch' => $branchName
+            while ($currentUrl && $pageCount < $maxPages) {
+                $params = [
+                    'q' => "date>={$since}",
+                    'sort' => '-date', 
+                    'pagelen' => 50,  // Smaller page size per branch
+                    'fields' => 'values.hash,values.date,values.message,values.author.raw,values.author.user.username,values.repository.full_name,next'
                 ];
+                
+                $response = $this->makeRequest($currentUrl, $params);
+                
+                if (!isset($response['values'])) {
+                    break;
+                }
+                
+                \Log::info("Found " . count($response['values']) . " commits on page " . ($pageCount + 1) . " for branch '{$branch}' in {$repoFullName}");
+                
+                foreach ($response['values'] as $commit) {
+                    // Check if we already have this commit from another branch
+                    $existingCommit = array_filter($allCommits, function($c) use ($commit) {
+                        return $c['hash'] === $commit['hash'];
+                    });
+                    
+                    if (!empty($existingCommit)) {
+                        // If this commit exists from a feature branch, keep the feature branch
+                        // If this commit exists from main/master/dev, update to more specific branch
+                        $existing = array_values($existingCommit)[0];
+                        $existingBranch = $existing['branch'];
+                        
+                        if (in_array($existingBranch, ['main', 'master', 'develop', 'dev']) && 
+                            !in_array($branch, ['main', 'master', 'develop', 'dev'])) {
+                            // Update to the more specific feature branch
+                            $key = array_search($existing, $allCommits);
+                            if ($key !== false) {
+                                $allCommits[$key]['branch'] = $branch;
+                            }
+                        }
+                        continue; // Skip duplicate commits
+                    }
+                    
+                    $allCommits[] = [
+                        'type' => 'commit',
+                        'repository' => $repoFullName,
+                        'hash' => $commit['hash'],
+                        'date' => $commit['date'],
+                        'message' => $commit['message'],
+                        'author_raw' => $commit['author']['raw'] ?? null,
+                        'author_username' => $commit['author']['user']['username'] ?? null,
+                        'ticket' => $this->extractTicket($commit['message']),
+                        'branch' => $branch  // Use actual branch name
+                    ];
+                }
+                
+                // Check for next page
+                $currentUrl = $response['next'] ?? null;
+                if ($currentUrl) {
+                    // Extract just the path from the full URL for API consistency
+                    $currentUrl = parse_url($currentUrl, PHP_URL_PATH) . '?' . parse_url($currentUrl, PHP_URL_QUERY);
+                    $currentUrl = ltrim($currentUrl, '/2.0/');
+                }
+                
+                $pageCount++;
             }
-            
-            // Check for next page
-            $currentUrl = $response['next'] ?? null;
-            if ($currentUrl) {
-                // Extract just the path from the full URL for API consistency
-                $currentUrl = parse_url($currentUrl, PHP_URL_PATH) . '?' . parse_url($currentUrl, PHP_URL_QUERY);
-                $currentUrl = ltrim($currentUrl, '/2.0/');
-            }
-            
-            $pageCount++;
         }
         
         \Log::info("Total commits fetched for {$repoFullName}: " . count($allCommits));
@@ -578,8 +654,9 @@ class BitbucketService
                     continue;
                 }
                 
-                // Extract branch from PR title/source branch
-                $branchName = $this->extractBranchFromPRTitle($pullRequest['title']) ?? 
+                // Use actual source branch from PR data, with fallbacks
+                $branchName = $pullRequest['source_branch'] ?? 
+                             $this->extractBranchFromPRTitle($pullRequest['title']) ?? 
                              $this->extractBranchFromCommitMessage($pullRequest['title']) ?? 'main';
                 
                 foreach ($response['values'] as $commit) {
@@ -598,7 +675,9 @@ class BitbucketService
                         'author_username' => $commit['author']['user']['username'] ?? null,
                         'ticket' => $this->extractTicket($commit['message']),
                         'branch' => $branchName,
-                        'from_pull_request' => $pullRequest['bitbucket_id']
+                        'from_pull_request' => $pullRequest['bitbucket_id'],
+                        'pr_source_branch' => $pullRequest['source_branch'] ?? null,
+                        'pr_destination_branch' => $pullRequest['destination_branch'] ?? null
                     ];
                     
                     // Filter by author if provided
@@ -689,8 +768,8 @@ class BitbucketService
                 'Accept' => 'application/json',
                 'User-Agent' => 'Hours-Laravel-API/1.0'
             ],
-            'timeout' => 30,
-            'connect_timeout' => 10,
+            'timeout' => 15, // Reduced from 30 to 15 seconds
+            'connect_timeout' => 5, // Reduced from 10 to 5 seconds
             'verify' => true
         ]);
         
@@ -830,22 +909,114 @@ class BitbucketService
     }
 
     /**
+     * Get repository branches
+     */
+    protected function getRepositoryBranches(string $repoFullName): array
+    {
+        $cacheKey = "repo_branches:{$repoFullName}";
+        
+        return Cache::remember($cacheKey, 60 * 60 * 4, function() use ($repoFullName) { // Cache for 4 hours
+            try {
+                \Log::info("Fetching branches for {$repoFullName}");
+                
+                $response = $this->makeRequest("repositories/{$repoFullName}/refs/branches", [
+                    'pagelen' => 100,
+                    'sort' => '-target.date',  // Sort by most recent commits
+                    'fields' => 'values.name,values.target.date'
+                ]);
+                
+                if (!isset($response['values'])) {
+                    return ['main']; // fallback
+                }
+                
+                $branches = array_map(function($branch) {
+                    return $branch['name'];
+                }, $response['values']);
+                
+                // Limit to most important branches to avoid too many API calls
+                $priorityBranches = [];
+                $otherBranches = [];
+                
+                foreach ($branches as $branch) {
+                    if (in_array($branch, ['main', 'master', 'develop', 'dev', 'staging', 'production']) ||
+                        preg_match('/^(feature|hotfix|bugfix|release|vue3)\//i', $branch)) {
+                        $priorityBranches[] = $branch;
+                    } else {
+                        $otherBranches[] = $branch;
+                    }
+                }
+                
+                // Return priority branches + up to 5 other recent branches
+                $result = array_merge($priorityBranches, array_slice($otherBranches, 0, 5));
+                
+                \Log::info("Found " . count($result) . " branches for {$repoFullName}: " . implode(', ', $result));
+                
+                return empty($result) ? ['main'] : $result;
+                
+            } catch (\Exception $e) {
+                \Log::warning("Failed to fetch branches for {$repoFullName}: " . $e->getMessage());
+                return ['main', 'develop', 'dev']; // Common fallbacks
+            }
+        });
+    }
+    
+    /**
      * Get main branch name for repository (simplified)
      */
     protected function getMainBranch(string $repoFullName): string
     {
-        $cacheKey = "main_branch:{$repoFullName}";
+        $branches = $this->getRepositoryBranches($repoFullName);
         
-        return Cache::remember($cacheKey, 60 * 60 * 24, function() use ($repoFullName) {
-            // For most repositories, use intelligent defaults based on naming patterns
-            // This avoids expensive API calls while still being reasonably accurate
+        // Find the most likely main branch
+        $mainBranchCandidates = ['main', 'master', 'develop', 'dev'];
+        
+        foreach ($mainBranchCandidates as $candidate) {
+            if (in_array($candidate, $branches)) {
+                return $candidate;
+            }
+        }
+        
+        // If no standard main branch found, return the first branch
+        return $branches[0] ?? 'main';
+    }
+
+    /**
+     * Extract branch information from pull request data
+     */
+    protected function extractPRBranchInfo($pr): ?string
+    {
+        // Try to get branch info from the Bitbucket data first
+        if (isset($pr->bitbucket_data) && is_array($pr->bitbucket_data)) {
+            $data = $pr->bitbucket_data;
             
-            if (str_contains($repoFullName, '/atabase-')) {
-                // Your internal repositories likely use 'main' or 'dev'
-                return 'main';
+            // Return source branch if available (this is the main field we should have)
+            if (isset($data['source_branch']) && !empty($data['source_branch'])) {
+                return $data['source_branch'];
             }
             
-            return 'main'; // Safe default for most modern repositories
-        });
+            // Try alternative field names for backwards compatibility
+            if (isset($data['pr_source_branch']) && !empty($data['pr_source_branch'])) {
+                return $data['pr_source_branch'];
+            }
+            
+            // Handle old data format where full PR data might be stored
+            if (isset($data['source'], $data['source']['branch'], $data['source']['branch']['name'])) {
+                return $data['source']['branch']['name'];
+            }
+        }
+        
+        // Try to extract from PR title as fallback
+        if (isset($pr->title)) {
+            $branchFromTitle = $this->extractBranchFromPRTitle($pr->title);
+            if ($branchFromTitle) {
+                return $branchFromTitle;
+            }
+        }
+        
+        // Log when we can't find branch info for debugging
+        \Log::warning("Could not extract branch info for PR: {$pr->title} (ID: {$pr->bitbucket_id})");
+        
+        // Final fallback - return null to indicate we don't know
+        return null;
     }
 }

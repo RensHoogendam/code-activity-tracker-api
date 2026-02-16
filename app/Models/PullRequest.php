@@ -47,11 +47,86 @@ class PullRequest extends Model
     }
 
     /**
-     * Scope to filter by author
+     * Scope to filter by author with email and name cross-referencing
      */
     public function scopeByAuthor($query, string $author)
     {
-        return $query->where('author_display_name', 'like', "%{$author}%");
+        return $query->where(function ($q) use ($author) {
+            // Direct display name matching
+            $q->where('author_display_name', 'like', "%{$author}%");
+              
+            // If searching by email, cross-reference with commits
+            if (filter_var($author, FILTER_VALIDATE_EMAIL)) {
+                // Find commits with this email and get their display names
+                try {
+                    $commitDisplayNames = \App\Models\Commit::where('author_raw', 'like', "%{$author}%")
+                        ->pluck('author_raw')
+                        ->map(function ($authorRaw) {
+                            if (preg_match('/^([^<]+)\s*</', $authorRaw, $matches)) {
+                                return trim($matches[1]);
+                            }
+                            return null;
+                        })
+                        ->filter()
+                        ->unique()
+                        ->toArray();
+                        
+                    foreach ($commitDisplayNames as $displayName) {
+                        $q->orWhere('author_display_name', 'like', "%{$displayName}%");
+                    }
+                } catch (\Exception $e) {
+                    // Silently continue if cross-reference fails
+                }
+                
+                // Convert email to potential display name (r.hoogendam@atabix.nl -> Rens Hoogendam)
+                $emailName = explode('@', $author)[0];
+                $displayName = str_replace('.', ' ', $emailName);
+                $displayName = ucwords($displayName);
+                $q->orWhere('author_display_name', 'like', "%{$displayName}%");
+            } else {
+                // For non-email searches, add common name variations
+                $q->orWhere('author_display_name', 'like', "%" . str_replace(' ', '', $author) . "%")  // Remove spaces
+                  ->orWhere('author_display_name', 'like', "%" . str_replace('_', ' ', $author) . "%")  // Underscore to space
+                  ->orWhere('author_display_name', 'like', "%" . str_replace('.', ' ', $author) . "%"); // Dot to space
+                
+                // If searching by something like "RensHoogendam", also check for "Rens Hoogendam"
+                if (!str_contains($author, ' ') && strlen($author) > 4) {
+                    // Try to split camelCase: "RensHoogendam" -> "Rens Hoogendam"
+                    $spaced = preg_replace('/([a-z])([A-Z])/', '$1 $2', $author);
+                    if ($spaced !== $author) {
+                        $q->orWhere('author_display_name', 'like', "%{$spaced}%");
+                    }
+                    
+                    // Also try with just first part: "RensHoogendam" -> "Rens"
+                    if (preg_match('/^([A-Z][a-z]+)/', $author, $matches)) {
+                        $firstName = $matches[1];
+                        $q->orWhere('author_display_name', 'like', "%{$firstName}%");
+                    }
+                }
+                
+                // Simple cross-reference: check if any commit authors contain this search term  
+                // and then match PRs by the display names from those commits
+                try {
+                    $matchingDisplayNames = \App\Models\Commit::where('author_raw', 'like', "%{$author}%")
+                        ->pluck('author_raw')
+                        ->map(function ($authorRaw) {
+                            if (preg_match('/^([^<]+)\s*</', $authorRaw, $matches)) {
+                                return trim($matches[1]);
+                            }
+                            return null;
+                        })
+                        ->filter()
+                        ->unique()
+                        ->toArray();
+                        
+                    foreach ($matchingDisplayNames as $displayName) {
+                        $q->orWhere('author_display_name', 'like', "%{$displayName}%");
+                    }
+                } catch (\Exception $e) {
+                    // Silently continue if cross-reference fails
+                }
+            }
+        });
     }
 
     /**

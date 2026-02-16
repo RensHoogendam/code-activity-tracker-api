@@ -47,13 +47,36 @@ class Commit extends Model
     }
 
     /**
-     * Scope to filter by author
+     * Scope to filter by author with flexible name and email matching
      */
     public function scopeByAuthor($query, string $author)
     {
         return $query->where(function ($q) use ($author) {
+            // Direct matches first (most common cases)
             $q->where('author_username', 'like', "%{$author}%")
-              ->orWhere('author_raw', 'like', "%{$author}%");
+              ->orWhere('author_raw', 'like', "%{$author}%")
+              
+              // Case-insensitive matching
+              ->orWhereRaw('LOWER(author_raw) LIKE LOWER(?)', ["%{$author}%"]);
+              
+            // If searching by email, also extract the name part for broader matching
+            if (filter_var($author, FILTER_VALIDATE_EMAIL)) {
+                // Extract name before @ symbol and try variations
+                $emailName = explode('@', $author)[0];
+                $q->orWhere('author_raw', 'like', "%{$emailName}%");
+                
+                // Handle common email-to-name patterns (dots to spaces, etc)
+                $displayName = str_replace('.', ' ', $emailName);
+                $displayName = ucwords($displayName);
+                $q->orWhere('author_raw', 'like', "%{$displayName}%");
+            } else {
+                // Handle common name variations for non-email searches
+                $q->orWhere('author_raw', 'like', "%" . str_replace(' ', '', $author) . "%") // Remove spaces
+                  ->orWhere('author_raw', 'like', "%" . str_replace('_', ' ', $author) . "%") // Underscore to space
+                  ->orWhere('author_raw', 'like', "%" . str_replace(' ', '_', $author) . "%") // Space to underscore
+                  ->orWhere('author_raw', 'like', "%" . str_replace('.', ' ', $author) . "%") // Dot to space
+                  ->orWhere('author_raw', 'like', "%" . str_replace(' ', '.', $author) . "%"); // Space to dot
+            }
         });
     }
 
