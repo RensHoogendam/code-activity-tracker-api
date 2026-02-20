@@ -17,6 +17,7 @@ class SyncCommits extends Command
     protected $signature = 'bitbucket:sync-commits 
                             {--days=14 : Number of days to sync commits for}
                             {--repository= : Specific repository to sync (full_name)}
+                            {--author= : Specific author email/username to sync activity for (includes feature branches)}
                             {--force : Force sync even if recently synced}';
 
     /**
@@ -31,11 +32,15 @@ class SyncCommits extends Command
      */
     public function handle(BitbucketService $bitbucketService)
     {
-        $days = $this->option('days');
+        $days = (int) $this->option('days');
         $repositoryFilter = $this->option('repository');
+        $authorFilter = $this->option('author');
         $forceSync = $this->option('force');
 
         $this->info("Syncing commits from Bitbucket (last {$days} days)...");
+        if ($authorFilter) {
+            $this->info("Author filter: {$authorFilter} (will sync across all branches)");
+        }
 
         try {
             // Get repositories to sync
@@ -50,7 +55,7 @@ class SyncCommits extends Command
                 return 0;
             }
 
-            $totalCommits = 0;
+            $totalCommitsCount = 0;
             $totalCreated = 0;
             $totalUpdated = 0;
             $totalErrors = 0;
@@ -61,12 +66,33 @@ class SyncCommits extends Command
                 $this->info("Syncing commits for: {$repository->full_name}");
 
                 try {
-                    // Fetch commits from Bitbucket API
-                    $commits = $bitbucketService->fetchCommitsForRepository($repository->full_name, $days);
-                    $repositoryCommits = count($commits);
-                    $totalCommits += $repositoryCommits;
+                    $allCommits = [];
 
-                    $this->info("  Found {$repositoryCommits} commits");
+                    // 1. Fetch from main branches
+                    $mainCommits = $bitbucketService->fetchCommitsForRepository($repository->full_name, $days);
+                    $allCommits = array_merge($allCommits, $mainCommits);
+                    $this->info("  Found " . count($mainCommits) . " commits from main branches");
+
+                    // 2. If author filter provided, fetch their activity across ALL branches
+                    if ($authorFilter) {
+                        $authorCommits = $bitbucketService->fetchAuthorActivityForRepository($repository->full_name, $days, $authorFilter);
+                        $allCommits = array_merge($allCommits, $authorCommits);
+                        $this->info("  Found " . count($authorCommits) . " cross-branch commits for author {$authorFilter}");
+                    }
+
+                    // Deduplicate by hash
+                    $uniqueCommits = [];
+                    foreach ($allCommits as $commit) {
+                        $uniqueCommits[$commit['hash']] = $commit;
+                    }
+                    $commits = array_values($uniqueCommits);
+
+                    $repositoryCommitsCount = count($commits);
+                    $totalCommitsCount += $repositoryCommitsCount;
+
+                    if ($repositoryCommitsCount > count($mainCommits)) {
+                        $this->info("  Total unique commits to process: {$repositoryCommitsCount}");
+                    }
 
                     $created = 0;
                     $updated = 0;
@@ -86,7 +112,8 @@ class SyncCommits extends Command
                                     'author_raw' => $commitData['author_raw'],
                                     'author_username' => $commitData['author_username'],
                                     'ticket' => $commitData['ticket'],
-                                    'bitbucket_data' => $commitData,
+                                    'branch' => $commitData['branch'] ?? $existingCommit->branch,
+                                    'bitbucket_data' => array_merge($existingCommit->bitbucket_data ?? [], $commitData),
                                     'last_fetched_at' => now()
                                 ]);
                                 $updated++;
@@ -100,6 +127,7 @@ class SyncCommits extends Command
                                     'author_raw' => $commitData['author_raw'],
                                     'author_username' => $commitData['author_username'],
                                     'ticket' => $commitData['ticket'],
+                                    'branch' => $commitData['branch'] ?? 'main',
                                     'bitbucket_data' => $commitData,
                                     'last_fetched_at' => now()
                                 ]);
@@ -118,8 +146,7 @@ class SyncCommits extends Command
                     $this->info("  Result: {$created} created, {$updated} updated");
 
                     // Small delay to avoid rate limiting
-                    if (!$repositoryFilter) {
-                        $this->info("  Waiting 1 second to avoid rate limiting...");
+                    if (!$repositoryFilter && count($repositories) > 1) {
                         sleep(1);
                     }
 
@@ -130,7 +157,7 @@ class SyncCommits extends Command
             }
 
             $this->info("\nSync completed!");
-            $this->info("Total commits processed: {$totalCommits}");
+            $this->info("Total unique commits processed: {$totalCommitsCount}");
             $this->info("Total created: {$totalCreated}");
             $this->info("Total updated: {$totalUpdated}");
             $this->info("Total errors: {$totalErrors}");

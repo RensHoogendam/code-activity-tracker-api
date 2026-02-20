@@ -20,7 +20,7 @@ class RefreshBitbucketDataJob implements ShouldQueue
      *
      * @var int
      */
-    public $timeout = 120; // 2 minutes timeout
+    public $timeout = 600; // 10 minutes timeout
 
     protected int $maxDays;
     protected ?array $selectedRepos;
@@ -58,6 +58,9 @@ class RefreshBitbucketDataJob implements ShouldQueue
                 'repositories_count' => $this->selectedRepos ? count($this->selectedRepos) : 'all',
                 'author_filter' => $this->authorFilter
             ]);
+            
+            // Set a custom log context for this job
+            \Log::withContext(['job_id' => $this->jobId]);
 
             // Set initial status immediately
             $this->updateJobStatus('processing', 'Initializing refresh job...', $startTime);
@@ -86,7 +89,8 @@ class RefreshBitbucketDataJob implements ShouldQueue
             };
 
             // Do the actual refresh with limited repos and progress callback
-            $bitbucketService->refreshDataFromApi($this->maxDays, $limitedRepos, $this->authorFilter, $progressCallback);
+            // Allow almost the full job timeout (leaving some buffer for cleanup)
+            $bitbucketService->refreshDataFromApi($this->maxDays, $limitedRepos, $this->authorFilter, $progressCallback, 550);
 
             // Clear relevant caches so next request gets fresh data
             $this->clearRelevantCaches();
@@ -114,6 +118,9 @@ class RefreshBitbucketDataJob implements ShouldQueue
             $this->updateJobStatus('failed', 'Refresh failed: ' . $e->getMessage(), $startTime);
 
             throw $e; // Re-throw to mark job as failed
+        } finally {
+            // Clear the log context for this job
+            \Log::withoutContext();
         }
     }
 

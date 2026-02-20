@@ -13,6 +13,7 @@ class BitbucketService
 {
     protected array $config;
     protected string $baseUrl = 'https://api.bitbucket.org/2.0';
+    protected ?Client $httpClient = null;
 
     public function __construct()
     {
@@ -33,19 +34,21 @@ class BitbucketService
     /**
      * Fetch all commits and pull requests (using local data when possible)
      */
-    public function fetchAllData(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, bool $forceRefresh = false): array
+    public function fetchAllData(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, bool $allowSyncRefresh = true): array
     {
-        // Force refresh is now handled by the controller with background jobs
-        // This method always returns local data
-        
         // Try to get data from local database first
         $localData = $this->fetchLocalData($maxDays, $selectedRepos, $authorFilter);
         
         // For now, prioritize local data to prevent timeouts
-        // Only refresh if we have no local data at all
+        // Only refresh if we have no local data at all AND sync refresh is allowed
         if (!empty($localData)) {
             \Log::info("Using local data (" . count($localData) . " items found)");
             return $localData;
+        }
+        
+        if (!$allowSyncRefresh) {
+            \Log::info("No local data found, but synchronous refresh is disabled. Returning empty results.");
+            return [];
         }
         
         // Only check for API refresh if we have no local data
@@ -53,7 +56,7 @@ class BitbucketService
         $needsRefresh = $this->checkIfDataNeedsRefresh($selectedRepos, $maxDays);
         
         if ($needsRefresh) {
-            \Log::info("Refreshing data from API");
+            \Log::info("Refreshing data from API synchronously");
             // Refresh data from API for repositories that need it
             $this->refreshDataFromApi($maxDays, $selectedRepos, $authorFilter);
             // Re-fetch local data after refresh
@@ -70,20 +73,28 @@ class BitbucketService
     {
         $allData = [];
         
-        // Get repositories
+        \Log::info("fetchLocalData called", ['maxDays' => $maxDays, 'selectedRepos' => $selectedRepos, 'authorFilter' => $authorFilter]);
+        
+        // Get repositories using the relationship approach (but with debug logging)
         $repositoriesQuery = Repository::active();
         if ($selectedRepos) {
             $repositoriesQuery->whereIn('full_name', $selectedRepos);
         }
         $repositories = $repositoriesQuery->get();
         
+        \Log::info("Found repositories", ['count' => $repositories->count(), 'names' => $repositories->pluck('full_name')]);
+        
         foreach ($repositories as $repository) {
-            // Fetch commits from database
+            \Log::info("Processing repository: {$repository->full_name}");
+            
+            // Fetch commits from database using relationship
             $commitsQuery = $repository->commits()->recent($maxDays);
             if ($authorFilter) {
                 $commitsQuery->byAuthor($authorFilter);
             }
             $commits = $commitsQuery->get();
+            
+            \Log::info("Found commits for {$repository->full_name}", ['count' => $commits->count()]);
             
             foreach ($commits as $commit) {
                 $allData[] = [
@@ -106,6 +117,8 @@ class BitbucketService
                 $prsQuery->byAuthor($authorFilter);
             }
             $pullRequests = $prsQuery->get();
+            
+            \Log::info("Found pull requests for {$repository->full_name}", ['count' => $pullRequests->count()]);
             
             foreach ($pullRequests as $pr) {
                 $allData[] = [
@@ -137,6 +150,8 @@ class BitbucketService
             return strcmp($dateB, $dateA);
         });
         
+        \Log::info("fetchLocalData completed", ['total_items' => count($allData)]);
+        
         return $allData;
     }
 
@@ -157,30 +172,18 @@ class BitbucketService
         }
         
         foreach ($repositories as $repository) {
-            // Check if we have any recent commits for this repository
-            $recentCommits = $repository->commits()
-                ->recent($maxDays)
-                ->count();
+            // Check for stale data based on the latest commit's last_fetched_at
+            $latestCommit = $repository->commits()
+                ->orderBy('last_fetched_at', 'desc')
+                ->first();
             
-            // Check if we have any recent pull requests for this repository  
-            $recentPrs = $repository->pullRequests()
-                ->recent($maxDays)
-                ->count();
-            
-            // If we have no recent data at all for this repo, we need to refresh
-            if ($recentCommits === 0 && $recentPrs === 0) {
-                \Log::info("No recent data for {$repository->full_name}, needs refresh");
+            if (!$latestCommit || !$latestCommit->last_fetched_at) {
+                \Log::info("No fetch history for {$repository->full_name}, needs refresh");
                 return true;
             }
             
-            // Check if any data is too old
-            $staleCommits = $repository->commits()
-                ->recent($maxDays)
-                ->needsUpdate($maxAgeMinutes)
-                ->count();
-            
-            if ($staleCommits > 0) {
-                \Log::info("Stale commits for {$repository->full_name}, needs refresh");
+            if ($latestCommit->last_fetched_at->addMinutes($maxAgeMinutes)->isPast()) {
+                \Log::info("Data for {$repository->full_name} is stale (last fetched: {$latestCommit->last_fetched_at}), needs refresh");
                 return true;
             }
         }
@@ -192,23 +195,47 @@ class BitbucketService
     /**
      * Refresh data from API for repositories that need it
      */
-    public function refreshDataFromApi(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, ?callable $progressCallback = null): void
+    public function refreshDataFromApi(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, ?callable $progressCallback = null, int $maxExecutionTime = 110): void
     {
         $startTime = microtime(true);
-        $maxExecutionTime = 45; // Limit to 45 seconds to prevent timeout
         
         $repositoriesQuery = Repository::active();
         if ($selectedRepos) {
             $repositoriesQuery->whereIn('full_name', $selectedRepos);
-            // For force refresh, limit to prevent timeouts even when specific repos are selected
-            $repositoriesQuery->limit(5);
+            // For force refresh, still limit but allow more time
+            $repositoriesQuery->limit(10); // Increased from 8 to 10
         } else {
             // Limit to prevent timeouts
-            $repositoriesQuery->limit(3); // Reduced from 10 to 3 for force refresh
+            $repositoriesQuery->limit(10); // Increased from 5 to 10
         }
-        $repositories = $repositoriesQuery->get();
         
-        \Log::info("Starting API refresh for " . count($repositories) . " repositories");
+        // Priority order: put likely repositories with user commits first
+        $priorityRepos = [
+            'atabix/atabase-admin-vue',
+            'atabix/atabase-accounts-vue', 
+            'atabix/atabase-cases-vue',
+            'atabix/javascript-packages'
+        ];
+        
+        if ($selectedRepos) {
+            // Reorder selected repos to prioritize user's likely repositories
+            $repoNames = collect($selectedRepos);
+            $prioritized = collect($priorityRepos)->intersect($repoNames);
+            $others = $repoNames->diff($prioritized);
+            $orderedRepos = $prioritized->merge($others)->values();
+            
+            $repositoriesQuery = Repository::active()->whereIn('full_name', $orderedRepos->toArray());
+            $repositories = $repositoriesQuery->get()->sortBy(function($repo) use ($orderedRepos) {
+                return $orderedRepos->search($repo->full_name);
+            })->values();
+        } else {
+            $repositories = $repositoriesQuery->get();
+        }
+        
+        \Log::info("Starting API refresh for " . count($repositories) . " repositories", [
+            'repo_order' => $repositories->pluck('full_name'),
+            'max_execution_time' => $maxExecutionTime
+        ]);
         
         // Notify progress callback about start
         if ($progressCallback) {
@@ -219,7 +246,7 @@ class BitbucketService
             // Check if we're approaching timeout limit
             $currentExecutionTime = microtime(true) - $startTime;
             if ($currentExecutionTime > $maxExecutionTime) {
-                \Log::warning("API refresh timeout approaching, stopping after {$index} repositories");
+                \Log::warning("API refresh timeout approaching, stopping after {$index} repositories", ['execution_time' => $currentExecutionTime]);
                 break;
             }
             
@@ -246,12 +273,24 @@ class BitbucketService
                 
                 // Notify progress
                 if ($progressCallback) {
-                    $progressCallback("Processing {$repository->full_name} (" . ($index + 1) . "/" . count($repositories) . ") - Fetching repository commits...");
+                    $progressCallback("Processing {$repository->full_name} (" . ($index + 1) . "/" . count($repositories) . ") - Fetching main branch commits...");
                 }
                 
-                // Also fetch regular repository commits (for commits not in PRs)
-                $repoCommits = $this->fetchCommitsFromApi($repository->full_name, $maxDays, $authorFilter);
+                // Fetch regular repository commits only from main branches since PR commits already cover feature branches
+                // This drastically reduces API calls and prevents timeouts
+                $mainBranches = ['main', 'master', 'develop', 'dev'];
+                $repoCommits = $this->fetchCommitsFromApi($repository->full_name, $maxDays, $authorFilter, $mainBranches);
                 $this->storeCommits($repository, $repoCommits);
+                
+                // If an author filter is provided, also fetch their commits across the ENTIRE repository
+                // This captures feature branch activity that doesn't have a PR yet
+                if (!empty($authorFilter)) {
+                    if ($progressCallback) {
+                        $progressCallback("Processing {$repository->full_name} (" . ($index + 1) . "/" . count($repositories) . ") - Fetching author activity...");
+                    }
+                    $authorCommits = $this->fetchAuthorCommitsFromApi($repository->full_name, $maxDays, $authorFilter);
+                    $this->storeCommits($repository, $authorCommits);
+                }
                 
                 \Log::info("Refreshed {$repository->full_name}: " . count($prCommits) . " PR commits, " . count($repoCommits) . " repo commits, " . count($pullRequests) . " pull requests");
                 
@@ -384,9 +423,12 @@ class BitbucketService
     /**
      * Fetch commits for a specific repository (for sync commands)
      */
-    public function fetchCommitsForRepository(string $repoFullName, int $maxDays = 14): array
+    public function fetchCommitsForRepository(string $repoFullName, int $maxDays = 14, ?array $branches = null): array
     {
-        return $this->fetchCommitsFromApi($repoFullName, $maxDays);
+        if ($branches === null) {
+            $branches = ['main', 'master', 'develop', 'dev'];
+        }
+        return $this->fetchCommitsFromApi($repoFullName, $maxDays, null, $branches);
     }
 
     /**
@@ -400,9 +442,84 @@ class BitbucketService
     /**
      * Fetch commits from Bitbucket API
      */
-    protected function fetchCommitsFromApi(string $repoFullName, int $maxDays, ?string $authorFilter = null): array
+    protected function fetchCommitsFromApi(string $repoFullName, int $maxDays, ?string $authorFilter = null, ?array $branches = null): array
     {
-        return $this->fetchCommits($repoFullName, $maxDays, $authorFilter);
+        return $this->fetchCommits($repoFullName, $maxDays, $authorFilter, $branches);
+    }
+
+    /**
+     * Fetch author activity across all branches for a repository
+     */
+    public function fetchAuthorActivityForRepository(string $repoFullName, int $maxDays, string $authorFilter): array
+    {
+        return $this->fetchAuthorCommitsFromApi($repoFullName, $maxDays, $authorFilter);
+    }
+
+    /**
+     * Fetch commits for a specific author across the entire repository (all branches)
+     */
+    protected function fetchAuthorCommitsFromApi(string $repoFullName, int $maxDays, string $authorFilter): array
+    {
+        $since = now()->subDays($maxDays)->format('Y-m-d');
+        
+        \Log::info("Fetching author commits across all branches for {$repoFullName} since {$since} (Author: {$authorFilter})");
+        
+        $allCommits = [];
+        
+        // Escape quotes for safely embedding in the query
+        $escapedFilter = str_replace('"', '\"', $authorFilter);
+        
+        // This query works on the base /commits endpoint to find activity across ALL branches
+        $q = "date>=\"{$since}\" AND (author.raw ~ \"{$escapedFilter}\" OR author.user.username = \"{$escapedFilter}\")";
+        
+        $params = [
+            'q' => $q,
+            'sort' => '-date', 
+            'pagelen' => 100,
+            'fields' => 'values.hash,values.date,values.message,values.author.raw,values.author.user.username,next'
+        ];
+        
+        try {
+            $response = $this->makeRequest("repositories/{$repoFullName}/commits", $params);
+            
+            if (isset($response['values'])) {
+                foreach ($response['values'] as $commit) {
+                    $allCommits[] = [
+                        'type' => 'commit',
+                        'repository' => $repoFullName,
+                        'hash' => $commit['hash'],
+                        'date' => $commit['date'],
+                        'message' => $commit['message'],
+                        'author_raw' => $commit['author']['raw'] ?? null,
+                        'author_username' => $commit['author']['user']['username'] ?? null,
+                        'ticket' => $this->extractTicket($commit['message']),
+                        'branch' => $this->extractBranchFromCommitMessage($commit['message']) ?? 'main'
+                    ];
+                }
+            }
+        } catch (\Exception $e) {
+            \Log::warning("Failed to fetch author commits across repo for {$repoFullName}: " . $e->getMessage());
+        }
+        
+        \Log::info("Found " . count($allCommits) . " cross-branch commits for author in {$repoFullName}");
+
+        // Local filtering to ensure we ONLY have commits from the correct author
+        // Bitbucket's 'q' parameter can sometimes be broader than expected
+        if (!empty($authorFilter) && !empty($allCommits)) {
+            $originalCount = count($allCommits);
+            $allCommits = array_filter($allCommits, function($commit) use ($authorFilter) {
+                $authorRaw = $commit['author_raw'] ?? '';
+                $authorUsername = $commit['author_username'] ?? '';
+                return str_contains($authorRaw, $authorFilter) || str_contains($authorUsername, $authorFilter);
+            });
+            $allCommits = array_values($allCommits); // Reindex
+            
+            if (count($allCommits) !== $originalCount) {
+                \Log::info("Locally filtered author commits for {$repoFullName}: {$originalCount} -> " . count($allCommits));
+            }
+        }
+        
+        return $allCommits;
     }
 
     /**
@@ -418,25 +535,48 @@ class BitbucketService
      */
     protected function storeCommits(Repository $repository, array $commits): void
     {
-        foreach ($commits as $commitData) {
-            Commit::updateOrCreate(
-                [
-                    'repository_id' => $repository->id,
-                    'hash' => $commitData['hash']
-                ],
-                [
-                    'commit_date' => $commitData['date'],
-                    'message' => $commitData['message'],
-                    'author_raw' => $commitData['author_raw'],
-                    'author_username' => $commitData['author_username'],
-                    'ticket' => $commitData['ticket'],
-                    'branch' => $commitData['branch'] ?? 'main',
-                    'pull_request_id' => $commitData['from_pull_request'] ?? null,
-                    'bitbucket_data' => $commitData,
-                    'last_fetched_at' => now()
-                ]
-            );
+        \Log::info("storeCommits called for {$repository->full_name}", ['commit_count' => count($commits)]);
+        
+        foreach ($commits as $index => $commitData) {
+            try {
+                $commit = Commit::updateOrCreate(
+                    [
+                        'repository_id' => $repository->id,
+                        'hash' => $commitData['hash']
+                    ],
+                    [
+                        'commit_date' => $commitData['date'],
+                        'repository' => $repository->full_name, // Add this for debugging
+                        'message' => $commitData['message'],
+                        'author_raw' => $commitData['author_raw'],
+                        'author_username' => $commitData['author_username'],
+                        'ticket' => $commitData['ticket'],
+                        'branch' => $commitData['branch'] ?? 'main',
+                        'pull_request_id' => $commitData['from_pull_request'] ?? null,
+                        'bitbucket_data' => $commitData,
+                        'last_fetched_at' => now()
+                    ]
+                );
+                
+                if ($index < 3) { // Log first 3 commits for debugging
+                    \Log::info("Stored commit for {$repository->full_name}", [
+                        'hash' => $commitData['hash'],
+                        'author' => $commitData['author_raw'],
+                        'date' => $commitData['date'],
+                        'saved_id' => $commit->id
+                    ]);
+                }
+                
+            } catch (\Exception $e) {
+                \Log::error("Failed to store commit for {$repository->full_name}", [
+                    'hash' => $commitData['hash'],
+                    'error' => $e->getMessage(),
+                    'commit_data' => $commitData
+                ]);
+            }
         }
+        
+        \Log::info("storeCommits completed for {$repository->full_name}", ['processed' => count($commits)]);
     }
 
     /**
@@ -534,7 +674,7 @@ class BitbucketService
     /**
      * Fetch commits directly from repository with proper branch detection
      */
-    protected function fetchCommits(string $repoFullName, int $maxDays, ?string $authorFilter = null): array
+    protected function fetchCommits(string $repoFullName, int $maxDays, ?string $authorFilter = null, ?array $branches = null): array
     {
         $since = now()->subDays($maxDays)->format('Y-m-d');
         
@@ -542,8 +682,17 @@ class BitbucketService
         
         $allCommits = [];
         
-        // First, get all branches for the repository
-        $branches = $this->getRepositoryBranches($repoFullName);
+        // First, get branches to fetch from
+        if ($branches === null) {
+            $branches = $this->getRepositoryBranches($repoFullName);
+        } else {
+            // If specific branches provided, filter to only those that actually exist
+            $existingBranches = $this->getRepositoryBranches($repoFullName);
+            $branches = array_intersect($branches, $existingBranches);
+            if (empty($branches) && !empty($existingBranches)) {
+                $branches = [$existingBranches[0]]; // Fallback to at least one branch
+            }
+        }
         
         foreach ($branches as $branch) {
             \Log::info("Fetching commits from branch '{$branch}' for {$repoFullName}");
@@ -553,8 +702,16 @@ class BitbucketService
             $pageCount = 0;
             
             while ($currentUrl && $pageCount < $maxPages) {
+                // Build query with date and author filter
+                $q = "date>={$since}";
+                if (!empty($authorFilter)) {
+                    // Escape quotes for safely embedding in the query
+                    $escapedFilter = str_replace('"', '\"', $authorFilter);
+                    $q .= " AND (author.raw ~ \"{$escapedFilter}\" OR author.user.username = \"{$escapedFilter}\")";
+                }
+
                 $params = [
-                    'q' => "date>={$since}",
+                    'q' => $q,
                     'sort' => '-date', 
                     'pagelen' => 50,  // Smaller page size per branch
                     'fields' => 'values.hash,values.date,values.message,values.author.raw,values.author.user.username,values.repository.full_name,next'
@@ -618,15 +775,35 @@ class BitbucketService
         
         \Log::info("Total commits fetched for {$repoFullName}: " . count($allCommits));
         
+        // Log date range for debugging
+        $since = now()->subDays($maxDays)->format('Y-m-d');
+        \Log::info("Date filter range: since {$since}, commits in date range: " . count($allCommits));
+        
         // Filter by author if provided
         if (!empty($authorFilter)) {
             \Log::info("Filtering by author: {$authorFilter}");
+            $originalCount = count($allCommits);
             $allCommits = array_filter($allCommits, function($commit) use ($authorFilter) {
-                $authorName = $commit['author_username'] ?? '';
-                $authorEmail = $commit['author_raw'] ?? '';
-                return str_contains($authorName, $authorFilter) || str_contains($authorEmail, $authorFilter);
+                $authorRaw = $commit['author_raw'] ?? '';
+                $authorUsername = $commit['author_username'] ?? '';
+                
+                // Log first few commits to debug the format
+                static $debugCount = 0;
+                if ($debugCount < 5) {
+                    \Log::info("Commit author debug", [
+                        'debug_count' => $debugCount + 1,
+                        'author_raw' => $authorRaw,
+                        'author_username' => $authorUsername,
+                        'filter' => $authorFilter,
+                        'raw_match' => str_contains($authorRaw, $authorFilter),
+                        'username_match' => str_contains($authorUsername, $authorFilter)
+                    ]);
+                    $debugCount++;
+                }
+                
+                return str_contains($authorRaw, $authorFilter) || str_contains($authorUsername, $authorFilter);
             });
-            \Log::info("After filtering: " . count($allCommits) . " commits for {$repoFullName}");
+            \Log::info("After filtering: " . count($allCommits) . " commits for {$repoFullName} (filtered {$originalCount} -> " . count($allCommits) . ")");
         }
         
         return $allCommits;
@@ -644,8 +821,16 @@ class BitbucketService
         
         foreach ($pullRequests as $pullRequest) {
             try {
-                // Get commits for this pull request
+                // Build query for this PR's commits
+                $q = "date>={$since}";
+                if (!empty($authorFilter)) {
+                    $escapedFilter = str_replace('"', '\"', $authorFilter);
+                    $q .= " AND (author.raw ~ \"{$escapedFilter}\" OR author.user.username = \"{$escapedFilter}\")";
+                }
+
+                // Get commits for this pull request with filtering
                 $response = $this->makeRequest("repositories/{$repoFullName}/pullrequests/{$pullRequest['bitbucket_id']}/commits", [
+                    'q' => $q,
                     'pagelen' => 100,
                     'fields' => 'values.hash,values.date,values.message,values.author.raw,values.author.user.username,next'
                 ]);
@@ -660,11 +845,6 @@ class BitbucketService
                              $this->extractBranchFromCommitMessage($pullRequest['title']) ?? 'main';
                 
                 foreach ($response['values'] as $commit) {
-                    // Filter by date
-                    if ($commit['date'] < $since) {
-                        continue;
-                    }
-                    
                     $commitData = [
                         'type' => 'commit',
                         'repository' => $repoFullName,
@@ -679,13 +859,6 @@ class BitbucketService
                         'pr_source_branch' => $pullRequest['source_branch'] ?? null,
                         'pr_destination_branch' => $pullRequest['destination_branch'] ?? null
                     ];
-                    
-                    // Filter by author if provided
-                    if ($authorFilter && 
-                        !str_contains($commitData['author_username'] ?? '', $authorFilter) &&
-                        !str_contains($commitData['author_raw'] ?? '', $authorFilter)) {
-                        continue;
-                    }
                     
                     $allCommits[] = $commitData;
                 }
@@ -762,19 +935,21 @@ class BitbucketService
             $url = $this->baseUrl . '/' . ltrim($endpoint, '/');
         }
         
-        $client = new Client([
-            'auth' => [$this->config['username'], $this->config['token']],
-            'headers' => [
-                'Accept' => 'application/json',
-                'User-Agent' => 'Hours-Laravel-API/1.0'
-            ],
-            'timeout' => 15, // Reduced from 30 to 15 seconds
-            'connect_timeout' => 5, // Reduced from 10 to 5 seconds
-            'verify' => true
-        ]);
+        if (!$this->httpClient) {
+            $this->httpClient = new Client([
+                'auth' => [$this->config['username'], $this->config['token']],
+                'headers' => [
+                    'Accept' => 'application/json',
+                    'User-Agent' => 'Hours-Laravel-API/1.0'
+                ],
+                'timeout' => 20, // Increased slightly from 15 to 20 seconds
+                'connect_timeout' => 5,
+                'verify' => true
+            ]);
+        }
         
         try {
-            $response = $client->get($url, ['query' => $params]);
+            $response = $this->httpClient->get($url, ['query' => $params]);
             
             if ($response->getStatusCode() !== 200) {
                 throw new \Exception("HTTP {$response->getStatusCode()}: {$response->getReasonPhrase()}");

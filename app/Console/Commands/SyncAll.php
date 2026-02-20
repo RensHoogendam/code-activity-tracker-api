@@ -14,6 +14,7 @@ class SyncAll extends Command
      */
     protected $signature = 'bitbucket:sync-all 
                             {--days=14 : Number of days to sync commits and PR data for}
+                            {--author= : Specific author email/username to sync activity for (defaults to BITBUCKET_AUTHOR_EMAIL env)}
                             {--force : Force sync even if recently synced}';
 
     /**
@@ -30,8 +31,12 @@ class SyncAll extends Command
     {
         $days = $this->option('days');
         $force = $this->option('force');
+        $author = $this->option('author') ?? env('BITBUCKET_AUTHOR_EMAIL');
 
         $this->info('Starting complete Bitbucket sync...');
+        if ($author) {
+            $this->info("Syncing activity for author: {$author}");
+        }
         $this->newLine();
 
         // Step 1: Sync repositories
@@ -51,7 +56,8 @@ class SyncAll extends Command
         $this->info('Step 2: Syncing commits...');
         $commitResult = $this->call('bitbucket:sync-commits', [
             '--days' => $days,
-            '--force' => $force
+            '--force' => $force,
+            '--author' => $author
         ]);
         
         if ($commitResult !== 0) {

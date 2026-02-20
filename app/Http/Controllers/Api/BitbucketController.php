@@ -44,7 +44,7 @@ class BitbucketController extends Controller
 
         $days = $request->input('days', 14);
         $repositories = $request->input('repositories');
-        $author = $request->input('author');
+        $author = $request->input('author', env('BITBUCKET_AUTHOR_EMAIL'));
         $forceRefresh = filter_var($request->input('force_refresh', false), FILTER_VALIDATE_BOOLEAN);
 
         // Set max execution time for force refresh to prevent server timeout
@@ -124,7 +124,7 @@ class BitbucketController extends Controller
                     'author' => $author
                 ]);
                 
-                // Return current data immediately with refresh status
+                // Return current data immediately WITHOUT triggering a sync refresh
                 $currentData = $this->bitbucketService->fetchAllData($days, $repositories, $author, false);
                 
                 return response()->json([
@@ -141,7 +141,8 @@ class BitbucketController extends Controller
                 ]);
             }
             
-            $data = $this->bitbucketService->fetchAllData($days, $repositories, $author, false);
+            // Allow sync refresh if data is missing for non-force requests
+            $data = $this->bitbucketService->fetchAllData($days, $repositories, $author, true);
             
             Log::info("fetchAllData completed", ['data_count' => count($data)]);
             
@@ -509,7 +510,7 @@ class BitbucketController extends Controller
 
         $days = $request->input('days', 14);
         $repositories = $request->input('repositories');
-        $author = $request->input('author');
+        $author = $request->input('author', env('BITBUCKET_AUTHOR_EMAIL'));
         $forceRefresh = filter_var($request->input('force_refresh', false), FILTER_VALIDATE_BOOLEAN);
         $typeFilter = $request->input('type', 'all');
 
@@ -607,7 +608,7 @@ class BitbucketController extends Controller
                     'author' => $author
                 ]);
                 
-                // Get current data and apply type filter
+                // Get current data WITHOUT triggering a sync refresh
                 $currentData = $this->bitbucketService->fetchAllData($days, $repositories, $author, false);
                 if ($typeFilter !== 'all') {
                     $currentData = array_filter($currentData, function($item) use ($typeFilter) {
@@ -635,7 +636,8 @@ class BitbucketController extends Controller
                 ]);
             }
             
-            $data = $this->bitbucketService->fetchAllData($days, $repositories, $author, false);
+            // Allow sync refresh for non-force requests if data is missing
+            $data = $this->bitbucketService->fetchAllData($days, $repositories, $author, true);
             
             Log::info("getActivity fetchAllData completed", ['data_count' => count($data)]);
             

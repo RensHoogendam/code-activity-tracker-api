@@ -1,0 +1,6 @@
+[
+  {
+    "type": "sqlite",
+    "path": "/Users/renshoogendam/Development/http/app/code-activity-tracker-api/database/database.sqlite"
+  }
+]

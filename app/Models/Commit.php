@@ -9,6 +9,7 @@ class Commit extends Model
 {
     protected $fillable = [
         'repository_id',
+        'repository',
         'hash',
         'commit_date',
         'message',
@@ -93,7 +94,9 @@ class Commit extends Model
      */
     public function scopeRecent($query, int $days = 14)
     {
-        return $query->where('commit_date', '>=', now()->subDays($days));
+        $cutoffDate = now()->subDays($days);
+        \Log::info("Commit recent scope: looking for commits after {$cutoffDate}");
+        return $query->where('commit_date', '>=', $cutoffDate);
     }
 
     /**
