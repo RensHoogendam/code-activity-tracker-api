@@ -114,7 +114,7 @@ class BitbucketController extends Controller
                 Cache::put("refresh_job_status:{$jobId}", $initialStatus, now()->addHour());
                 Cache::put('latest_refresh_status', $initialStatus, now()->addHour());
                 
-                $job = new RefreshBitbucketDataJob($days, $repositories, $author, $jobId);
+                $job = new RefreshBitbucketDataJob($days, $repositories, $author, $jobId, true);
                 dispatch($job);
                 
                 Log::info("Started background refresh job", [
@@ -259,7 +259,7 @@ class BitbucketController extends Controller
             Cache::put("refresh_job_status:{$jobId}", $initialStatus, now()->addHour());
             Cache::put('latest_refresh_status', $initialStatus, now()->addHour());
             
-            $job = new RefreshBitbucketDataJob($days, $repositories, $author, $jobId);
+            $job = new RefreshBitbucketDataJob($days, $repositories, $author, $jobId, true);
             dispatch($job);
             
             Log::info("Started background refresh job via API", [
@@ -598,7 +598,7 @@ class BitbucketController extends Controller
                 Cache::put("refresh_job_status:{$jobId}", $initialStatus, now()->addHour());
                 Cache::put('latest_refresh_status', $initialStatus, now()->addHour());
                 
-                $job = new RefreshBitbucketDataJob($days, $repositories, $author, $jobId);
+                $job = new RefreshBitbucketDataJob($days, $repositories, $author, $jobId, true);
                 dispatch($job);
                 
                 Log::info("Started background refresh job for activity", [
@@ -807,17 +807,28 @@ class BitbucketController extends Controller
     public function syncCommits(Request $request): JsonResponse
     {
         $days = $request->input('days', 14);
+        $repo = $request->input('repository');
+        $author = $request->input('author', env('BITBUCKET_AUTHOR_EMAIL'));
         
         try {
-            Artisan::call('bitbucket:sync-commits', [
+            $params = [
                 '--days' => $days,
-                '--force' => true
-            ]);
+                '--force' => true,
+                '--author' => $author
+            ];
+
+            if ($repo) {
+                $params['--repository'] = $repo;
+            }
+
+            Artisan::call('bitbucket:sync-commits', $params);
             $output = Artisan::output();
             
             return response()->json([
                 'message' => 'Commits sync completed',
                 'days' => $days,
+                'repository' => $repo,
+                'author' => $author,
                 'output' => $output
             ]);
         } catch (\Exception $e) {
@@ -834,17 +845,25 @@ class BitbucketController extends Controller
     public function syncPullRequests(Request $request): JsonResponse
     {
         $days = $request->input('days', 14);
+        $repo = $request->input('repository');
         
         try {
-            Artisan::call('bitbucket:sync-pull-requests', [
+            $params = [
                 '--days' => $days,
                 '--force' => true
-            ]);
+            ];
+
+            if ($repo) {
+                $params['--repository'] = $repo;
+            }
+
+            Artisan::call('bitbucket:sync-pull-requests', $params);
             $output = Artisan::output();
             
             return response()->json([
                 'message' => 'Pull requests sync completed',
                 'days' => $days,
+                'repository' => $repo,
                 'output' => $output
             ]);
         } catch (\Exception $e) {
@@ -861,17 +880,28 @@ class BitbucketController extends Controller
     public function syncAll(Request $request): JsonResponse
     {
         $days = $request->input('days', 14);
+        $repositories = $request->input('repositories', []);
+        $author = $request->input('author', env('BITBUCKET_AUTHOR_EMAIL'));
         
         try {
-            Artisan::call('bitbucket:sync-all', [
+            $params = [
                 '--days' => $days,
-                '--force' => true
-            ]);
+                '--force' => true,
+                '--author' => $author
+            ];
+
+            if (!empty($repositories)) {
+                $params['--repository'] = $repositories;
+            }
+
+            Artisan::call('bitbucket:sync-all', $params);
             $output = Artisan::output();
             
             return response()->json([
                 'message' => 'Complete sync finished',
                 'days' => $days,
+                'repositories' => $repositories,
+                'author' => $author,
                 'output' => $output
             ]);
         } catch (\Exception $e) {

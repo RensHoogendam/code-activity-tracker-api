@@ -81,17 +81,49 @@ class RefreshBitbucketDataJob implements ShouldQueue
             };
 
             if ($this->fullSync) {
-                // Execute the full sync command in the background
-                $this->updateJobStatus('processing', 'Starting full Bitbucket sync (repos, commits, PRs)...', $startTime);
+                // Step 1: Sync the repository list once
+                $this->updateJobStatus('processing', 'Step 1: Syncing repository list from Bitbucket...', $startTime);
+                Artisan::call('bitbucket:sync-repositories', ['--force' => true]);
                 
-                Artisan::call('bitbucket:sync-all', [
-                    '--days' => $this->maxDays,
-                    '--author' => $this->authorFilter,
-                    '--force' => true
-                ]);
-                
-                $output = Artisan::output();
-                Log::info("Full sync command completed", ['output' => $output]);
+                if ($this->selectedRepos && count($this->selectedRepos) > 0) {
+                    $totalRepos = count($this->selectedRepos);
+                    
+                    foreach ($this->selectedRepos as $index => $repo) {
+                        $currentNum = $index + 1;
+                        
+                        // Update status for this specific repo
+                        $this->updateJobStatus('processing', "Step 2/3: Syncing [{$currentNum}/{$totalRepos}] - {$repo} (commits & PRs)", $startTime);
+                        
+                        // Sync commits for this repo
+                        Artisan::call('bitbucket:sync-commits', [
+                            '--days' => $this->maxDays,
+                            '--author' => $this->authorFilter,
+                            '--repository' => $repo,
+                            '--force' => true
+                        ]);
+
+                        // Sync PRs for this repo
+                        Artisan::call('bitbucket:sync-pull-requests', [
+                            '--days' => $this->maxDays,
+                            '--repository' => $repo,
+                            '--force' => true
+                        ]);
+                    }
+                } else {
+                    // Fallback for when no specific repos are selected
+                    $this->updateJobStatus('processing', 'Step 2: Syncing all commits...', $startTime);
+                    Artisan::call('bitbucket:sync-commits', [
+                        '--days' => $this->maxDays,
+                        '--author' => $this->authorFilter,
+                        '--force' => true
+                    ]);
+
+                    $this->updateJobStatus('processing', 'Step 3: Syncing all pull requests...', $startTime);
+                    Artisan::call('bitbucket:sync-pull-requests', [
+                        '--days' => $this->maxDays,
+                        '--force' => true
+                    ]);
+                }
                 
                 $this->updateJobStatus('processing', 'Full sync completed. Finalizing...', $startTime);
             } else {
@@ -206,8 +238,7 @@ class RefreshBitbucketDataJob implements ShouldQueue
             $keysToCheck = [
                 'bitbucket_data_' . $this->maxDays . '_' . ($this->authorFilter ?? 'all'),
                 'bitbucket_activity_' . $this->maxDays . '_' . ($this->authorFilter ?? 'all'),
-                'repositories_with_activity',
-                'latest_refresh_status'
+                'repositories_with_activity'
             ];
 
             foreach ($keysToCheck as $key) {
