@@ -8,6 +8,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
@@ -20,22 +21,24 @@ class RefreshBitbucketDataJob implements ShouldQueue
      *
      * @var int
      */
-    public $timeout = 600; // 10 minutes timeout
+    public $timeout = 900; // Increased to 15 minutes timeout
 
     protected int $maxDays;
     protected ?array $selectedRepos;
     protected ?string $authorFilter;
     protected string $jobId;
+    protected bool $fullSync;
 
     /**
      * Create a new job instance.
      */
-    public function __construct(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, ?string $jobId = null)
+    public function __construct(int $maxDays = 14, ?array $selectedRepos = null, ?string $authorFilter = null, ?string $jobId = null, bool $fullSync = false)
     {
         $this->maxDays = $maxDays;
         $this->selectedRepos = $selectedRepos;
         $this->authorFilter = $authorFilter;
         $this->jobId = $jobId ?? uniqid('refresh_', true);
+        $this->fullSync = $fullSync;
     }
 
     /**
@@ -56,26 +59,15 @@ class RefreshBitbucketDataJob implements ShouldQueue
                 'job_id' => $this->jobId,
                 'max_days' => $this->maxDays,
                 'repositories_count' => $this->selectedRepos ? count($this->selectedRepos) : 'all',
-                'author_filter' => $this->authorFilter
+                'author_filter' => $this->authorFilter,
+                'full_sync' => $this->fullSync
             ]);
             
             // Set a custom log context for this job
             \Log::withContext(['job_id' => $this->jobId]);
 
             // Set initial status immediately
-            $this->updateJobStatus('processing', 'Initializing refresh job...', $startTime);
-
-            // Limit repositories to prevent timeout (maximum 5 repos per job)
-            $limitedRepos = $this->selectedRepos;
-            if ($limitedRepos && count($limitedRepos) > 5) {
-                $limitedRepos = array_slice($limitedRepos, 0, 5);
-                Log::info("Limited repositories to prevent timeout", [
-                    'original_count' => count($this->selectedRepos),
-                    'limited_count' => count($limitedRepos)
-                ]);
-                
-                $this->updateJobStatus('processing', 'Limited to ' . count($limitedRepos) . ' repositories to prevent timeout', $startTime);
-            }
+            $this->updateJobStatus('processing', 'Initializing ' . ($this->fullSync ? 'full sync' : 'refresh') . ' job...', $startTime);
 
             // Create progress callback to update job status
             $progressCallback = function($message) use ($startTime) {
@@ -88,9 +80,25 @@ class RefreshBitbucketDataJob implements ShouldQueue
                 $this->updateJobStatus('processing', $message, $startTime);
             };
 
-            // Do the actual refresh with limited repos and progress callback
-            // Allow almost the full job timeout (leaving some buffer for cleanup)
-            $bitbucketService->refreshDataFromApi($this->maxDays, $limitedRepos, $this->authorFilter, $progressCallback, 550);
+            if ($this->fullSync) {
+                // Execute the full sync command in the background
+                $this->updateJobStatus('processing', 'Starting full Bitbucket sync (repos, commits, PRs)...', $startTime);
+                
+                Artisan::call('bitbucket:sync-all', [
+                    '--days' => $this->maxDays,
+                    '--author' => $this->authorFilter,
+                    '--force' => true
+                ]);
+                
+                $output = Artisan::output();
+                Log::info("Full sync command completed", ['output' => $output]);
+                
+                $this->updateJobStatus('processing', 'Full sync completed. Finalizing...', $startTime);
+            } else {
+                // Do the actual refresh with selected repos and progress callback
+                // The service will handle prioritization and its own internal limits
+                $bitbucketService->refreshDataFromApi($this->maxDays, $this->selectedRepos, $this->authorFilter, $progressCallback, 850);
+            }
 
             // Clear relevant caches so next request gets fresh data
             $this->clearRelevantCaches();
@@ -98,11 +106,12 @@ class RefreshBitbucketDataJob implements ShouldQueue
             $executionTime = round(microtime(true) - $startTime, 2);
             
             // Update job status to completed
-            $this->updateJobStatus('completed', "Refresh completed successfully in {$executionTime} seconds", $startTime);
+            $this->updateJobStatus('completed', ($this->fullSync ? 'Full sync' : 'Refresh') . " completed successfully in {$executionTime} seconds", $startTime);
 
             Log::info("Background refresh job completed", [
                 'job_id' => $this->jobId,
-                'execution_time' => $executionTime
+                'execution_time' => $executionTime,
+                'full_sync' => $this->fullSync
             ]);
 
         } catch (\Exception $e) {
@@ -111,7 +120,8 @@ class RefreshBitbucketDataJob implements ShouldQueue
             Log::error("Background refresh job failed", [
                 'job_id' => $this->jobId,
                 'error' => $e->getMessage(),
-                'execution_time' => $executionTime
+                'execution_time' => $executionTime,
+                'full_sync' => $this->fullSync
             ]);
 
             // Update job status to failed
@@ -137,7 +147,8 @@ class RefreshBitbucketDataJob implements ShouldQueue
             'parameters' => [
                 'max_days' => $this->maxDays,
                 'selected_repos_count' => $this->selectedRepos ? count($this->selectedRepos) : null,
-                'author_filter' => $this->authorFilter
+                'author_filter' => $this->authorFilter,
+                'full_sync' => $this->fullSync
             ]
         ];
 
