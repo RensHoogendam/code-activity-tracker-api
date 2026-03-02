@@ -44,9 +44,11 @@ class DevelopmentStatus extends Command
         $this->newLine();
 
         // Check web server (this is harder to detect reliably, so we'll just give guidance)
+        $projectName = basename(base_path());
         $this->comment('🌐 Web Server Status:');
-        $this->comment('   📍 Check if http://127.0.0.1:8000 is accessible');
-        $this->comment('   📍 Stop with Ctrl+C in the terminal where it\'s running');
+        $this->comment("   📍 Herd URL: http://{$projectName}.test");
+        $this->comment('   📍 PHP Serve: http://127.0.0.1:8000');
+        $this->comment('   📍 Stop serve with Ctrl+C in its terminal');
 
         $this->newLine();
 

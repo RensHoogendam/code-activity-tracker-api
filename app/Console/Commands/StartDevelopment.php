@@ -11,7 +11,9 @@ class StartDevelopment extends Command
      *
      * @var string
      */
-    protected $signature = 'start {--port=8000 : The port to run the server on}';
+    protected $signature = 'start 
+                            {--port=8000 : The port to run the server on}
+                            {--herd : Use Laravel Herd for the web server (skips artisan serve)}';
 
     /**
      * The console command description.
@@ -26,6 +28,7 @@ class StartDevelopment extends Command
     public function handle()
     {
         $port = $this->option('port');
+        $useHerd = $this->option('herd');
         
         $this->info('🚀 Starting Laravel development environment...');
         $this->newLine();
@@ -48,6 +51,18 @@ class StartDevelopment extends Command
                 $this->error('❌ Failed to start queue worker');
                 return Command::FAILURE;
             }
+        }
+
+        if ($useHerd) {
+            $projectName = basename(base_path());
+            $this->newLine();
+            $this->info("✅ Development environment (worker only) is ready for Herd");
+            $this->info("📍 Herd URL: http://{$projectName}.test");
+            $this->info("📍 Job Status: http://{$projectName}.test/api/bitbucket/refresh-status");
+            $this->newLine();
+            $this->comment('To stop queue worker: php artisan stop');
+            $this->newLine();
+            return Command::SUCCESS;
         }
 
         $this->newLine();
